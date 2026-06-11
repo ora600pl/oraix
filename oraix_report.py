@@ -26,7 +26,7 @@ from statistics import mean
 from typing import Iterable
 
 
-TIERS = ("primary", "secondary", "tertiary")
+LSSRAD_GROUP_LABELS = ("group-1", "group-2", "group-3")
 NUMBER_RE = r"\d+(?:\.\d+)?"
 
 
@@ -35,7 +35,9 @@ class CpuPlacement:
     cpu: int
     ref: int | None
     srad: int
-    tier: str
+    lssrad_group_index: int
+    lssrad_group_label: str
+    smt_position: int
     group: str
 
 
@@ -74,7 +76,7 @@ class TraceThread:
     name: str = ""
     samples: int = 0
     cpus: Counter[int] = field(default_factory=Counter)
-    tiers: Counter[str] = field(default_factory=Counter)
+    lssrad_groups: Counter[str] = field(default_factory=Counter)
 
 
 def read_text(path: str | Path) -> str:
@@ -114,13 +116,19 @@ def parse_lssrad(text: str) -> dict[int, CpuPlacement]:
         srad = int(match.group(1))
         groups = match.group(3).split()
         for index, group in enumerate(groups):
-            tier = TIERS[index] if index < len(TIERS) else f"tier-{index + 1}"
-            for cpu in expand_cpu_group(group):
+            lssrad_group_label = (
+                LSSRAD_GROUP_LABELS[index]
+                if index < len(LSSRAD_GROUP_LABELS)
+                else f"group-{index + 1}"
+            )
+            for smt_position, cpu in enumerate(expand_cpu_group(group)):
                 placements[cpu] = CpuPlacement(
                     cpu=cpu,
                     ref=current_ref,
                     srad=srad,
-                    tier=tier,
+                    lssrad_group_index=index + 1,
+                    lssrad_group_label=lssrad_group_label,
+                    smt_position=smt_position,
                     group=group,
                 )
     return placements
@@ -258,7 +266,7 @@ def parse_trace_report(text: str, placements: dict[int, CpuPlacement]) -> dict[t
         row.cpus[cpu] += 1
         placement = placements.get(cpu)
         if placement:
-            row.tiers[placement.tier] += 1
+            row.lssrad_groups[placement.lssrad_group_label] += 1
     return threads
 
 
@@ -269,7 +277,7 @@ def merge_trace_by_pid(trace_threads: dict[tuple[int, int | None], TraceThread])
         target.name = target.name or row.name
         target.samples += row.samples
         target.cpus.update(row.cpus)
-        target.tiers.update(row.tiers)
+        target.lssrad_groups.update(row.lssrad_groups)
     return by_pid
 
 
@@ -420,7 +428,7 @@ def summarize_sql_ids(
                 "cpu": 0.0,
                 "pids": set(),
                 "cpus": Counter(),
-                "tiers": Counter(),
+                "lssrad_groups": Counter(),
                 "waits": Counter(),
                 "users": Counter(),
             },
@@ -434,7 +442,7 @@ def summarize_sql_ids(
         trace = trace_by_pid.get(proc.pid)
         if trace:
             row["cpus"].update(trace.cpus)
-            row["tiers"].update(trace.tiers)
+            row["lssrad_groups"].update(trace.lssrad_groups)
 
     return sorted(grouped.values(), key=lambda row: float(row["cpu"]), reverse=True)
 
@@ -458,32 +466,122 @@ def merge_processes(*sources: dict[int, OracleProcess]) -> dict[int, OracleProce
     return merged
 
 
-def layer_stats(
+def summarize_mpstat_rows(cpus: list[int], mpstat: dict[int, MpstatCpu]) -> dict[str, float]:
+    mp_rows = [mpstat[cpu] for cpu in cpus if cpu in mpstat]
+    return {
+        "cpus": len(cpus),
+        "active_cpus": len(mp_rows),
+        "cs": sum(row.avg("cs") for row in mp_rows),
+        "ics": sum(row.avg("ics") for row in mp_rows),
+        "rq": sum(row.avg("rq") for row in mp_rows),
+        "bound": sum(row.avg("bound") for row in mp_rows),
+        "s0rd": avg_of(mp_rows, "S0rd"),
+        "s1rd": avg_of(mp_rows, "S1rd"),
+        "s3rd": avg_of(mp_rows, "S3rd"),
+        "s3hrd": avg_of(mp_rows, "S3hrd"),
+        "s4hrd": avg_of(mp_rows, "S4hrd"),
+        "s5hrd": avg_of(mp_rows, "S5hrd"),
+        "nsp": avg_of(mp_rows, "%nsp"),
+    }
+
+
+def lssrad_group_stats(
     placements: dict[int, CpuPlacement], mpstat: dict[int, MpstatCpu]
 ) -> dict[str, dict[str, float]]:
     grouped: dict[str, list[int]] = defaultdict(list)
     for cpu, placement in placements.items():
-        grouped[placement.tier].append(cpu)
+        grouped[placement.lssrad_group_label].append(cpu)
 
     stats: dict[str, dict[str, float]] = {}
-    for tier, cpus in grouped.items():
-        mp_rows = [mpstat[cpu] for cpu in cpus if cpu in mpstat]
-        stats[tier] = {
-            "cpus": len(cpus),
-            "active_cpus": len(mp_rows),
-            "cs": sum(row.avg("cs") for row in mp_rows),
-            "ics": sum(row.avg("ics") for row in mp_rows),
-            "rq": sum(row.avg("rq") for row in mp_rows),
-            "bound": sum(row.avg("bound") for row in mp_rows),
-            "s0rd": avg_of(mp_rows, "S0rd"),
-            "s1rd": avg_of(mp_rows, "S1rd"),
-            "s3rd": avg_of(mp_rows, "S3rd"),
-            "s3hrd": avg_of(mp_rows, "S3hrd"),
-            "s4hrd": avg_of(mp_rows, "S4hrd"),
-            "s5hrd": avg_of(mp_rows, "S5hrd"),
-            "nsp": avg_of(mp_rows, "%nsp"),
-        }
+    for label, cpus in grouped.items():
+        stats[label] = summarize_mpstat_rows(cpus, mpstat)
     return stats
+
+
+def smt_position_stats(
+    placements: dict[int, CpuPlacement],
+    mpstat: dict[int, MpstatCpu],
+    trace_by_pid: dict[int, TraceThread],
+) -> list[dict[str, object]]:
+    trace_counts = trace_cpu_counts(trace_by_pid)
+    total_trace_samples = sum(trace_counts.values())
+    grouped: dict[int, list[int]] = defaultdict(list)
+    for cpu, placement in placements.items():
+        grouped[placement.smt_position].append(cpu)
+
+    rows: list[dict[str, object]] = []
+    for smt_position, cpus in sorted(grouped.items()):
+        samples = sum(trace_counts.get(cpu, 0) for cpu in cpus)
+        stats = summarize_mpstat_rows(cpus, mpstat)
+        active_lcpus = sum(1 for cpu in cpus if trace_counts.get(cpu, 0) > 0)
+        rows.append(
+            {
+                "smt_position": smt_position,
+                "lcpus": sorted(cpus),
+                "active_lcpu_count": active_lcpus,
+                "trace_samples_total": samples,
+                "trace_samples_percent": (samples / total_trace_samples * 100.0) if total_trace_samples else 0.0,
+                "average_samples_per_lcpu": (samples / len(cpus)) if cpus else 0.0,
+                "rq_total": stats["rq"],
+                "bound_total": stats["bound"],
+                "nsp_avg": stats["nsp"],
+                "s3hrd": stats["s3hrd"],
+                "s4hrd": stats["s4hrd"],
+                "s5hrd": stats["s5hrd"],
+            }
+        )
+    return rows
+
+
+def topology_summary(placements: dict[int, CpuPlacement]) -> dict[str, object]:
+    range_lengths = sorted({len(expand_cpu_group(placement.group)) for placement in placements.values()})
+    smt_positions = sorted({placement.smt_position for placement in placements.values()})
+    if len(range_lengths) == 1:
+        smt_mode = f"likely SMT-{range_lengths[0]}"
+        warning = ""
+    else:
+        smt_mode = "inconsistent"
+        warning = "CPU range lengths are inconsistent; SMT position inference may be unreliable."
+    return {
+        "range_lengths": range_lengths,
+        "unique_smt_positions": smt_positions,
+        "unique_smt_position_count": len(smt_positions),
+        "smt_mode": smt_mode,
+        "warning": warning,
+    }
+
+
+def lssrad_smt_mapping_example() -> dict[int, tuple[str, int]]:
+    example = """
+REF1   SRAD        MEM      CPU
+0
+          0   1.00      0-3 32-35 96-99
+"""
+    placements = parse_lssrad(example)
+    return {
+        cpu: (placements[cpu].lssrad_group_label, placements[cpu].smt_position)
+        for cpu in (0, 1, 2, 3, 32, 33, 34, 35, 96, 97, 98, 99)
+    }
+
+
+def selftest_lssrad_smt_mapping() -> None:
+    expected = {
+        0: ("group-1", 0),
+        1: ("group-1", 1),
+        2: ("group-1", 2),
+        3: ("group-1", 3),
+        32: ("group-2", 0),
+        33: ("group-2", 1),
+        34: ("group-2", 2),
+        35: ("group-2", 3),
+        96: ("group-3", 0),
+        97: ("group-3", 1),
+        98: ("group-3", 2),
+        99: ("group-3", 3),
+    }
+    actual = lssrad_smt_mapping_example()
+    if actual != expected:
+        raise AssertionError(f"Unexpected lssrad SMT mapping: {actual}")
 
 
 def trace_cpu_counts(trace_by_pid: dict[int, TraceThread]) -> Counter[int]:
@@ -500,18 +598,25 @@ def physical_core_stats(
 ) -> list[dict[str, object]]:
     by_srad: dict[tuple[int | None, int], dict[str, list[int]]] = defaultdict(dict)
     for placement in placements.values():
-        by_srad[(placement.ref, placement.srad)].setdefault(placement.tier, expand_cpu_group(placement.group))
+        by_srad[(placement.ref, placement.srad)].setdefault(
+            placement.lssrad_group_label, expand_cpu_group(placement.group)
+        )
 
     trace_counts = trace_cpu_counts(trace_by_pid)
     rows: list[dict[str, object]] = []
-    for (ref, srad), tier_groups in sorted(by_srad.items(), key=lambda item: ((item[0][0] is None, item[0][0] or -1), item[0][1])):
-        max_threads = max((len(cpus) for cpus in tier_groups.values()), default=0)
-        for core_index in range(max_threads):
+    for (ref, srad), lssrad_groups in sorted(by_srad.items(), key=lambda item: ((item[0][0] is None, item[0][0] or -1), item[0][1])):
+        max_threads = max((len(cpus) for cpus in lssrad_groups.values()), default=0)
+        for smt_position in range(max_threads):
             lcpus: dict[str, int] = {}
-            for tier in TIERS:
-                cpus = tier_groups.get(tier, [])
-                if core_index < len(cpus):
-                    lcpus[tier] = cpus[core_index]
+            group_count = max((int(label.split("-")[-1]) for label in lssrad_groups), default=0)
+            group_labels = [
+                LSSRAD_GROUP_LABELS[index] if index < len(LSSRAD_GROUP_LABELS) else f"group-{index + 1}"
+                for index in range(group_count)
+            ]
+            for label in group_labels:
+                cpus = lssrad_groups.get(label, [])
+                if smt_position < len(cpus):
+                    lcpus[label] = cpus[smt_position]
 
             available = len(lcpus)
             active = sum(1 for cpu in lcpus.values() if trace_counts.get(cpu, 0) > 0)
@@ -520,10 +625,10 @@ def physical_core_stats(
             bound_total = sum(mpstat[cpu].avg("bound") for cpu in lcpus.values() if cpu in mpstat)
             rows.append(
                 {
-                    "core": f"{ref if ref is not None else '-'}:{srad}:{core_index}",
+                    "topology_key": f"{ref if ref is not None else '-'}:{srad}:{smt_position}",
                     "ref": ref,
                     "srad": srad,
-                    "core_index": core_index,
+                    "smt_position": smt_position,
                     "lcpus": lcpus,
                     "available_threads": available,
                     "active_threads": active,
@@ -549,8 +654,8 @@ def build_findings(
     processes: dict[int, OracleProcess],
 ) -> list[tuple[str, str, str]]:
     findings: list[tuple[str, str, str]] = []
-    total_rq = sum(tier.get("rq", 0.0) for tier in stats.values())
-    total_bound = sum(tier.get("bound", 0.0) for tier in stats.values())
+    total_rq = sum(group.get("rq", 0.0) for group in stats.values())
+    total_bound = sum(group.get("bound", 0.0) for group in stats.values())
 
     if total_rq >= 8 or total_bound >= 8:
         findings.append(
@@ -562,29 +667,28 @@ def build_findings(
             )
         )
 
-    primary = stats.get("primary", {})
-    secondary = stats.get("secondary", {})
-    tertiary = stats.get("tertiary", {})
-    if primary and secondary and primary.get("rq", 0) > secondary.get("rq", 0) * 1.6 + 1:
+    group_1 = stats.get("group-1", {})
+    group_2 = stats.get("group-2", {})
+    if group_1 and group_2 and group_1.get("rq", 0) > group_2.get("rq", 0) * 1.6 + 1:
         findings.append(
             (
                 "warning",
-                "Run queue is concentrated on primary LCPUs",
-                f"Primary rq={primary.get('rq', 0):.1f}, secondary rq={secondary.get('rq', 0):.1f}. "
-                "This may indicate uneven thread placement or delayed virtual processor unfolding.",
+                "Run queue is concentrated on LSSRAD group #1",
+                f"LSSRAD group #1 rq={group_1.get('rq', 0):.1f}, group #2 rq={group_2.get('rq', 0):.1f}. "
+                "This may indicate uneven CPU range usage or delayed virtual processor unfolding; it does not identify SMT primary/secondary thread classes.",
             )
         )
     high_remote = [
-        (tier, values)
-        for tier, values in stats.items()
+        (group_label, values)
+        for group_label, values in stats.items()
         if values.get("s3rd", 0) >= 5 or values.get("s3hrd", 100) < 85
     ]
-    for tier, values in high_remote:
+    for group_label, values in high_remote:
         findings.append(
             (
                 "warning",
-                f"Elevated remote dispatch/readiness on {tier}",
-                f"{tier}: S3rd={values.get('s3rd', 0):.1f}%, S3hrd={values.get('s3hrd', 0):.1f}%. "
+                f"Elevated remote dispatch/readiness on {group_label}",
+                f"{group_label}: S3rd={values.get('s3rd', 0):.1f}%, S3hrd={values.get('s3hrd', 0):.1f}%. "
                 "This is a signal of possible scheduler or affinity latency.",
             )
         )
@@ -629,28 +733,28 @@ def diagnose_vpm_throughput_mode(
     processes: dict[int, OracleProcess],
     trace_by_pid: dict[int, TraceThread],
 ) -> dict[str, object]:
-    total_rq = sum(tier.get("rq", 0.0) for tier in stats.values())
-    total_bound = sum(tier.get("bound", 0.0) for tier in stats.values())
-    primary = stats.get("primary", {})
-    secondary = stats.get("secondary", {})
-    tertiary = stats.get("tertiary", {})
-    primary_rq = primary.get("rq", 0.0)
-    secondary_rq = secondary.get("rq", 0.0)
-    tertiary_rq = tertiary.get("rq", 0.0)
-    non_primary_rq = secondary_rq + tertiary_rq
+    total_rq = sum(group.get("rq", 0.0) for group in stats.values())
+    total_bound = sum(group.get("bound", 0.0) for group in stats.values())
+    group_1 = stats.get("group-1", {})
+    group_2 = stats.get("group-2", {})
+    group_3 = stats.get("group-3", {})
+    group_1_rq = group_1.get("rq", 0.0)
+    group_2_rq = group_2.get("rq", 0.0)
+    group_3_rq = group_3.get("rq", 0.0)
+    non_group_1_rq = group_2_rq + group_3_rq
     cpu_bound = total_rq >= 8 or total_bound >= 8
-    primary_skew = primary_rq > max(secondary_rq * 1.6 + 1, non_primary_rq * 0.65)
+    group_1_skew = group_1_rq > max(group_2_rq * 1.6 + 1, non_group_1_rq * 0.65)
     remote_latency = any(values.get("s3rd", 0.0) >= 5 or values.get("s3hrd", 100.0) < 85 for values in stats.values())
     oracle_cpu_wait = any(
         proc.wait_class == "CPU" and "Runqueue" in proc.event and (proc.oratop_cpu or 0) > 0
         for proc in processes.values()
     )
 
-    trace_tiers: Counter[str] = Counter()
+    trace_groups: Counter[str] = Counter()
     for row in trace_by_pid.values():
-        trace_tiers.update(row.tiers)
-    trace_total = sum(trace_tiers.values())
-    primary_trace_share = trace_tiers.get("primary", 0) / trace_total if trace_total else 0.0
+        trace_groups.update(row.lssrad_groups)
+    trace_total = sum(trace_groups.values())
+    group_1_trace_share = trace_groups.get("group-1", 0) / trace_total if trace_total else 0.0
 
     summarized = summarize_events(events)
     cpu_event_dbt = sum(
@@ -661,38 +765,38 @@ def diagnose_vpm_throughput_mode(
 
     evidence = [
         f"mpstat total rq={total_rq:.1f}, total bound={total_bound:.1f}; CPU-bound={yes_no(cpu_bound)}.",
-        f"Tier run queue: primary={primary_rq:.1f}, secondary={secondary_rq:.1f}, tertiary={tertiary_rq:.1f}; primary skew={yes_no(primary_skew)}.",
+        f"LSSRAD group run queue: group #1={group_1_rq:.1f}, group #2={group_2_rq:.1f}, group #3={group_3_rq:.1f}; group #1 skew={yes_no(group_1_skew)}.",
         f"Oracle CPU Runqueue waits={yes_no(oracle_cpu_wait)}, aggregated CPU wait DB time={cpu_event_dbt:.1f}%.",
     ]
     if trace_total:
         evidence.append(
-            f"Trace tier samples: {top_counter(trace_tiers, 5)}; primary trace share={primary_trace_share * 100:.1f}%."
+            f"Trace samples by LSSRAD group: {top_counter(trace_groups, 5)}; group #1 trace share={group_1_trace_share * 100:.1f}%."
         )
     else:
         evidence.append("Trace did not contain decodable Oracle CPU samples, so the vpm diagnosis is based on mpstat and oratop only.")
     if remote_latency:
         evidence.append("Remote dispatch/readiness metrics are elevated, which can compound placement or unfolding latency.")
 
-    score = sum([cpu_bound, primary_skew, oracle_cpu_wait, remote_latency])
-    if cpu_bound and primary_skew and (oracle_cpu_wait or remote_latency):
+    score = sum([cpu_bound, group_1_skew, oracle_cpu_wait, remote_latency])
+    if cpu_bound and group_1_skew and (oracle_cpu_wait or remote_latency):
         level = "critical"
         title = "vpm_throughput_mode is likely worth testing"
         recommended_value = 1
         body = (
-            "The same capture window shows CPU pressure, stronger queues on primary LCPUs, and Oracle CPU wait or remote readiness signals. "
+            "The same capture window shows CPU pressure, stronger queues on LSSRAD group #1, and Oracle CPU wait or remote readiness signals. "
             "That pattern is consistent with folding or slow unfolding of virtual processors, so vpm_throughput_mode has a plausible chance of improving throughput."
         )
-    elif cpu_bound and (oracle_cpu_wait or primary_skew):
+    elif cpu_bound and (oracle_cpu_wait or group_1_skew):
         level = "warning"
         title = "vpm_throughput_mode may help, but evidence is partial"
         recommended_value = 1
         body = (
-            "The report sees CPU pressure plus at least one Oracle or tier-placement signal, but the full folding/unfolding pattern is not conclusive. "
+            "The report sees CPU pressure plus at least one Oracle or LSSRAD group placement signal, but the full folding/unfolding pattern is not conclusive. "
             "Testing vpm_throughput_mode is reasonable if the LPAR is throughput-sensitive and power saving is less important."
         )
     elif score:
         level = "info"
-        title = "vpm_throughput_mode is not the primary recommendation"
+        title = "vpm_throughput_mode is not the main recommendation"
         recommended_value = 0
         body = (
             "Some weak CPU or placement signals are present, but the report does not show a clear CPU-bound unfolding problem in this capture window."
@@ -701,7 +805,7 @@ def diagnose_vpm_throughput_mode(
         level = "ok"
         title = "vpm_throughput_mode is not indicated by this report"
         recommended_value = 0
-        body = "The supplied files do not show CPU-bound queues, Oracle CPU Runqueue waits, or tier imbalance strong enough to point at folding or slow unfolding."
+        body = "The supplied files do not show CPU-bound queues, Oracle CPU Runqueue waits, or LSSRAD group imbalance strong enough to point at folding or slow unfolding."
     commands = {
         "show_current": "schedo -o vpm_throughput_mode",
         "set_runtime": f"schedo -o vpm_throughput_mode={recommended_value}",
@@ -750,13 +854,15 @@ def render_report(
     events: list[dict[str, str]],
     out_path: Path,
 ) -> None:
-    stats = layer_stats(placements, mpstat)
+    stats = lssrad_group_stats(placements, mpstat)
     findings = build_findings(stats, events, processes)
     vpm_diagnosis = diagnose_vpm_throughput_mode(stats, events, processes, trace_by_pid)
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     summarized_events = summarize_events(events)
     top_sql = summarize_sql_ids(processes, trace_by_pid)
     core_stats = physical_core_stats(placements, mpstat, trace_by_pid)
+    smt_stats = smt_position_stats(placements, mpstat, trace_by_pid)
+    topology = topology_summary(placements)
 
     top_processes = sorted(
         processes.values(),
@@ -791,9 +897,9 @@ tr:hover td {{ background: #fafcff; }}
 .info {{ border-left-color: #2672b9; }}
 .ok {{ border-left-color: #2e7d32; }}
 .pill {{ display: inline-block; padding: 2px 7px; border-radius: 99px; font-size: 12px; background: #e9eef5; }}
-.primary {{ background: #dcecff; }}
-.secondary {{ background: #e1f3df; }}
-.tertiary {{ background: #fff0cf; }}
+.group-1 {{ background: #dcecff; }}
+.group-2 {{ background: #e1f3df; }}
+.group-3 {{ background: #fff0cf; }}
 .note {{ background: #fff; border: 1px solid #d8dde5; border-radius: 8px; padding: 12px 14px; }}
 code {{ background: #eef2f6; padding: 1px 4px; border-radius: 4px; }}
 </style>
@@ -814,16 +920,21 @@ code {{ background: #eef2f6; padding: 1px 4px; border-radius: 4px; }}
 <h2>Findings</h2>
 {render_findings(findings)}
 
-<h2>Primary / secondary / tertiary LCPU</h2>
-<p class="note">Tier classification comes from the CPU group order reported by <code>lssrad -av</code> within each SRAD. PID/TID to CPU placement comes from the raw AIX trace decoded by <code>trcrpt</code>.</p>
-{render_layer_table(stats)}
+<h2>LSSRAD Group Summary</h2>
+<p class="note">LSSRAD group labels are derived from CPU range order in <code>lssrad -av</code>. They do not represent SMT primary/secondary/tertiary thread classes. Use the SMT position summary for SMT behavior.</p>
+{render_lssrad_group_table(stats)}
 
 <h2>LCPU Map</h2>
 {render_cpu_table(placements, mpstat)}
 
-<h2>Physical Core Thread Utilization</h2>
-<p class="note">This table groups LCPUs by their position inside each <code>lssrad -av</code> SRAD row. The utilization percentage is Oracle trace coverage: active LCPU threads with at least one Oracle trace sample divided by available LCPU threads for that physical core position. <code>mpstat -d</code> contributes run queue, bound, and dispatch metrics; it does not provide a direct per-LCPU busy percentage in this format.</p>
+<h2>Topology by SMT Position</h2>
+{render_topology_note(topology)}
+<p class="note">This table groups LCPUs by REF, SRAD and inferred SMT position. The group columns correspond to the order of CPU ranges reported by <code>lssrad -av</code>; they are not SMT primary/secondary/tertiary thread classes. SMT behavior should be interpreted using the SMT position column and the SMT-position summary.</p>
 {render_physical_core_table(core_stats)}
+
+<h2>SMT-Position Summary</h2>
+<p class="note">SMT position is inferred from the index of an LCPU inside its CPU range. For SMT-4 ranges such as <code>0-3</code>, positions are 0, 1, 2, 3. This table answers whether Oracle trace samples concentrate on lower SMT positions or deeper SMT sibling positions.</p>
+{render_smt_position_table(smt_stats)}
 
 <h2>Oracle Processes</h2>
 {render_process_table(top_processes, trace_by_pid)}
@@ -906,15 +1017,27 @@ def render_vpm_diagnosis(diagnosis: dict[str, object]) -> str:
     )
 
 
-def render_layer_table(stats: dict[str, dict[str, float]]) -> str:
+def render_topology_note(topology: dict[str, object]) -> str:
+    warning = topology.get("warning")
+    warning_html = f"<br><strong>Warning:</strong> {esc(warning)}" if warning else ""
+    return (
+        '<p class="note">'
+        f"Detected {esc(topology.get('smt_mode', 'unknown'))}; "
+        f"unique SMT positions={esc(topology.get('unique_smt_positions', []))}; "
+        f"CPU range lengths={esc(topology.get('range_lengths', []))}."
+        f"{warning_html}</p>"
+    )
+
+
+def render_lssrad_group_table(stats: dict[str, dict[str, float]]) -> str:
     rows = []
-    for tier in TIERS:
-        values = stats.get(tier)
+    for group_label in sorted(stats, key=lambda label: int(label.split("-")[-1])):
+        values = stats.get(group_label)
         if not values:
             continue
         rows.append(
             "<tr>"
-            f'<td><span class="pill {tier}">{tier}</span></td>'
+            f'<td><span class="pill {group_label}">{group_label}</span></td>'
             f"<td>{fmt(values.get('cpus'), 0)}</td>"
             f"<td>{fmt(values.get('rq'))}</td>"
             f"<td>{fmt(values.get('bound'))}</td>"
@@ -926,7 +1049,7 @@ def render_layer_table(stats: dict[str, dict[str, float]]) -> str:
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>Tier</th><th>LCPU</th><th>rq</th><th>bound</th>"
+        "<table><thead><tr><th>LSSRAD group</th><th>LCPU</th><th>rq</th><th>bound</th>"
         "<th>S0rd</th><th>S1rd</th><th>S3rd</th><th>S3hrd</th><th>%nsp</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
@@ -945,7 +1068,9 @@ def render_cpu_table(
             f"<td>{cpu}</td>"
             f"<td>{esc(placement.ref if placement.ref is not None else '-')}</td>"
             f"<td>{placement.srad}</td>"
-            f'<td><span class="pill {placement.tier}">{placement.tier}</span></td>'
+            f'<td><span class="pill {placement.lssrad_group_label}">{placement.lssrad_group_label}</span></td>'
+            f"<td>{placement.lssrad_group_index}</td>"
+            f"<td>{placement.smt_position}</td>"
             f"<td>{esc(placement.group)}</td>"
             f"<td>{fmt(mp.avg('rq') if mp else None)}</td>"
             f"<td>{fmt(mp.avg('cs') if mp else None)}</td>"
@@ -957,7 +1082,7 @@ def render_cpu_table(
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>LCPU</th><th>REF</th><th>SRAD</th><th>Tier</th><th>Group</th>"
+        "<table><thead><tr><th>LCPU</th><th>REF</th><th>SRAD</th><th>LSSRAD group</th><th>Group index</th><th>SMT position</th><th>CPU range</th>"
         "<th>rq</th><th>cs</th><th>ics</th><th>S0rd</th><th>S1rd</th><th>S3rd</th><th>S3hrd</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
@@ -971,13 +1096,13 @@ def render_physical_core_table(rows_data: list[dict[str, object]]) -> str:
         trace_by_lcpu = row["trace_by_lcpu"]
         rows.append(
             "<tr>"
-            f"<td>{esc(row['core'])}</td>"
+            f"<td>{esc(row['topology_key'])}</td>"
             f"<td>{esc(row['ref'] if row['ref'] is not None else '-')}</td>"
             f"<td>{esc(row['srad'])}</td>"
-            f"<td>{esc(row['core_index'])}</td>"
-            f"<td>{esc(lcpus.get('primary', '-'))}</td>"
-            f"<td>{esc(lcpus.get('secondary', '-'))}</td>"
-            f"<td>{esc(lcpus.get('tertiary', '-'))}</td>"
+            f"<td>{esc(row['smt_position'])}</td>"
+            f"<td>{esc(lcpus.get('group-1', '-'))}</td>"
+            f"<td>{esc(lcpus.get('group-2', '-'))}</td>"
+            f"<td>{esc(lcpus.get('group-3', '-'))}</td>"
             f"<td>{esc(row['active_threads'])}/{esc(row['available_threads'])}</td>"
             f"<td>{fmt(float(row['active_percent']))}%</td>"
             f"<td>{esc(row['trace_samples'])}</td>"
@@ -988,10 +1113,39 @@ def render_physical_core_table(rows_data: list[dict[str, object]]) -> str:
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>Core</th><th>REF</th><th>SRAD</th><th>Core position</th>"
-        "<th>Primary LCPU</th><th>Secondary LCPU</th><th>Tertiary LCPU</th>"
+        "<table><thead><tr><th>Topology key</th><th>REF</th><th>SRAD</th><th>SMT position</th>"
+        "<th>Group 1 LCPU</th><th>Group 2 LCPU</th><th>Group 3 LCPU</th>"
         "<th>Active threads</th><th>Active %</th><th>Trace samples</th><th>Samples by LCPU</th>"
         "<th>rq total</th><th>bound total</th><th>avg %nsp</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def render_smt_position_table(rows_data: list[dict[str, object]]) -> str:
+    rows = []
+    for row in rows_data:
+        rows.append(
+            "<tr>"
+            f"<td>{esc(row['smt_position'])}</td>"
+            f"<td>{esc(', '.join(str(cpu) for cpu in row['lcpus']))}</td>"
+            f"<td>{esc(row['active_lcpu_count'])}</td>"
+            f"<td>{esc(row['trace_samples_total'])}</td>"
+            f"<td>{fmt(float(row['trace_samples_percent']))}%</td>"
+            f"<td>{fmt(float(row['average_samples_per_lcpu']))}</td>"
+            f"<td>{fmt(float(row['rq_total']))}</td>"
+            f"<td>{fmt(float(row['bound_total']))}</td>"
+            f"<td>{fmt(float(row['nsp_avg']))}%</td>"
+            f"<td>{fmt(float(row['s3hrd']))}%</td>"
+            f"<td>{fmt(float(row['s4hrd']))}%</td>"
+            f"<td>{fmt(float(row['s5hrd']))}%</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>SMT position</th><th>LCPU list</th><th>Active LCPU count</th>"
+        "<th>Trace samples total</th><th>Trace samples %</th><th>Average samples per LCPU</th>"
+        "<th>rq total</th><th>bound total</th><th>avg %nsp</th><th>S3hrd</th><th>S4hrd</th><th>S5hrd</th>"
+        "</tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1009,7 +1163,7 @@ def render_process_table(processes: list[OracleProcess], trace_by_pid: dict[int,
         trace = trace_by_pid.get(proc.pid)
         trace_samples = trace.samples if trace else 0
         cpus = top_counter(trace.cpus if trace else Counter())
-        tiers = top_counter(trace.tiers if trace else Counter())
+        lssrad_groups = top_counter(trace.lssrad_groups if trace else Counter())
         rows.append(
             "<tr>"
             f"<td>{proc.pid}</td>"
@@ -1020,7 +1174,7 @@ def render_process_table(processes: list[OracleProcess], trace_by_pid: dict[int,
             f"<td>{fmt(proc.oratop_cpu)}%</td>"
             f"<td>{trace_samples}</td>"
             f"<td>{esc(cpus)}</td>"
-            f"<td>{esc(tiers)}</td>"
+            f"<td>{esc(lssrad_groups)}</td>"
             f"<td>{esc(proc.status or '-')} {esc(proc.state or '')}</td>"
             f"<td>{esc(proc.wait_class or '-')}</td>"
             f"<td>{esc(proc.event or '-')}</td>"
@@ -1028,7 +1182,7 @@ def render_process_table(processes: list[OracleProcess], trace_by_pid: dict[int,
         )
     return (
         "<table><thead><tr><th>PID/SPID</th><th>Name</th><th>SID</th><th>User</th><th>SQL_ID</th><th>oratop %CPU</th>"
-        "<th>trace samples</th><th>CPU</th><th>Tier</th><th>Status</th><th>Wait class</th><th>Event</th></tr></thead><tbody>"
+        "<th>trace samples</th><th>CPU</th><th>LSSRAD group</th><th>Status</th><th>Wait class</th><th>Event</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1043,11 +1197,11 @@ def render_trace_table(trace_by_pid: dict[int, TraceThread]) -> str:
             f"<td>{esc(trace.name or '-')}</td>"
             f"<td>{trace.samples}</td>"
             f"<td>{esc(top_counter(trace.cpus, 12))}</td>"
-            f"<td>{esc(top_counter(trace.tiers, 5))}</td>"
+            f"<td>{esc(top_counter(trace.lssrad_groups, 5))}</td>"
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>PID</th><th>Name</th><th>trace samples</th><th>CPU</th><th>Tier</th></tr></thead><tbody>"
+        "<table><thead><tr><th>PID</th><th>Name</th><th>trace samples</th><th>CPU</th><th>LSSRAD group</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1064,13 +1218,13 @@ def render_sql_table(rows_data: list[dict[str, object]]) -> str:
             f"<td>{len(pids)}</td>"
             f"<td>{esc(', '.join(str(pid) for pid in pids[:12]))}</td>"
             f"<td>{esc(top_counter(row['cpus'], 12))}</td>"
-            f"<td>{esc(top_counter(row['tiers'], 5))}</td>"
+            f"<td>{esc(top_counter(row['lssrad_groups'], 5))}</td>"
             f"<td>{esc(top_counter(row['users'], 5))}</td>"
             f"<td>{esc(top_counter(row['waits'], 5))}</td>"
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>SQL_ID</th><th>sum %CPU</th><th>PIDs</th><th>PID list</th><th>CPU</th><th>Tier</th><th>Users</th><th>Wait classes</th></tr></thead><tbody>"
+        "<table><thead><tr><th>SQL_ID</th><th>sum %CPU</th><th>PIDs</th><th>PID list</th><th>CPU</th><th>LSSRAD group</th><th>Users</th><th>Wait classes</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1110,12 +1264,14 @@ def build_json_report(
     processes: dict[int, OracleProcess],
     events: list[dict[str, str]],
 ) -> dict[str, object]:
-    stats = layer_stats(placements, mpstat)
+    stats = lssrad_group_stats(placements, mpstat)
     findings = build_findings(stats, events, processes)
     summarized_events = summarize_events(events)
     top_sql = summarize_sql_ids(processes, trace_by_pid)
     vpm_diagnosis = diagnose_vpm_throughput_mode(stats, events, processes, trace_by_pid)
     core_stats = physical_core_stats(placements, mpstat, trace_by_pid)
+    smt_stats = smt_position_stats(placements, mpstat, trace_by_pid)
+    topology = topology_summary(placements)
 
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -1131,15 +1287,19 @@ def build_json_report(
             for level, title, details in findings
         ],
         "vpm_throughput_mode": vpm_diagnosis,
-        "tier_stats": stats,
+        "topology": topology,
+        "lssrad_group_stats": stats,
         "physical_core_thread_utilization": core_stats,
+        "smt_position_summary": smt_stats,
         "lcpu_map": [
             {
                 "lcpu": cpu,
                 "ref": placement.ref,
                 "srad": placement.srad,
-                "tier": placement.tier,
-                "group": placement.group,
+                "lssrad_group_index": placement.lssrad_group_index,
+                "lssrad_group_label": placement.lssrad_group_label,
+                "smt_position": placement.smt_position,
+                "cpu_range": placement.group,
                 "mpstat": {
                     "rq": mpstat[cpu].avg("rq") if cpu in mpstat else None,
                     "cs": mpstat[cpu].avg("cs") if cpu in mpstat else None,
@@ -1168,7 +1328,7 @@ def build_json_report(
                 "trace": {
                     "samples": trace_by_pid[proc.pid].samples if proc.pid in trace_by_pid else 0,
                     "cpus": counter_to_dict(trace_by_pid[proc.pid].cpus) if proc.pid in trace_by_pid else {},
-                    "tiers": counter_to_dict(trace_by_pid[proc.pid].tiers) if proc.pid in trace_by_pid else {},
+                    "lssrad_groups": counter_to_dict(trace_by_pid[proc.pid].lssrad_groups) if proc.pid in trace_by_pid else {},
                 },
             }
             for proc in sorted(processes.values(), key=lambda item: item.pid)
@@ -1179,7 +1339,7 @@ def build_json_report(
                 "name": trace.name,
                 "samples": trace.samples,
                 "cpus": counter_to_dict(trace.cpus),
-                "tiers": counter_to_dict(trace.tiers),
+                "lssrad_groups": counter_to_dict(trace.lssrad_groups),
             }
             for trace in sorted(trace_by_pid.values(), key=lambda row: row.samples, reverse=True)
         ],
@@ -1189,7 +1349,7 @@ def build_json_report(
                 "sum_cpu": row["cpu"],
                 "pids": sorted(row["pids"]),
                 "cpus": counter_to_dict(row["cpus"]),
-                "tiers": counter_to_dict(row["tiers"]),
+                "lssrad_groups": counter_to_dict(row["lssrad_groups"]),
                 "users": counter_to_dict(row["users"]),
                 "wait_classes": counter_to_dict(row["waits"]),
             }
@@ -1258,6 +1418,7 @@ Example:
 
 
 def main() -> None:
+    selftest_lssrad_smt_mapping()
     args = parse_args()
     placements = parse_lssrad(read_text(args.lssrad))
     mpstat, mp_config = parse_mpstat(read_text(args.mpstat))
