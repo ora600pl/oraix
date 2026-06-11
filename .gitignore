@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local diagnostic captures can contain hostnames, process names, SQL IDs, and workload details.
+test_files/
+*.out
+*.bin
+*.trc
+*.trace
+
