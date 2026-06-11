@@ -1,12 +1,12 @@
 # ORAIX Oracle LCPU Report
 
-ORAIX Oracle LCPU Report is a small AIX-focused diagnostic toolkit for Oracle workloads running on IBM Power systems. It collects and correlates `oratop`, AIX trace, `lssrad`, and `mpstat` output to show where Oracle processes actually ran across LCPUs, LSSRAD CPU range groups, and inferred SMT positions.
+ORAIX Oracle LCPU Report is a small AIX-focused diagnostic toolkit for Oracle workloads running on IBM Power systems. It collects and correlates `smtctl`, `oratop`, AIX trace, `lssrad`, and `mpstat` output to show where Oracle processes actually ran across LCPUs, SRADs, physical cores, and SMT thread classes.
 
 The generated report helps answer practical performance questions:
 
 - Which Oracle processes and SQL IDs ran on which CPUs?
-- Are Oracle foreground/background processes concentrated in one LSSRAD CPU range group?
-- Is Oracle work mostly running on lower SMT positions or deeper SMT sibling positions?
+- Are Oracle foreground/background processes concentrated in one SRAD or LSSRAD CPU range?
+- Is Oracle work running mostly on SMT primary threads, or spilling into secondary/tertiary/quaternary threads?
 - Is the system CPU-bound during the captured workload window?
 - Are there signs of folding or slow virtual processor unfolding?
 - Would `vpm_throughput_mode` be worth testing?
@@ -26,6 +26,7 @@ Collection must run on AIX with the standard AIX tools available:
 - `trcrpt`
 - `mpstat`
 - `oratop`
+- `smtctl`
 
 Report generation requires Python 3. It can run on AIX, Linux, or macOS when the trace input is already decoded with `trcrpt`. If you pass a binary AIX trace file, run the report generator on AIX so it can call `trcrpt`.
 
@@ -34,6 +35,7 @@ Report generation requires Python 3. It can run on AIX, Linux, or macOS when the
 Run `oratop` during the same workload window as the AIX collection:
 
 ```sh
+smtctl > /tmp/smtctl.out
 oratop -b -n 10 -f -r / as sysdba > /tmp/oratop.out
 ```
 
@@ -53,6 +55,7 @@ The script writes:
 Equivalent manual collection:
 
 ```sh
+smtctl > /tmp/oraix_capture/smtctl.out
 lssrad -av > /tmp/oraix_capture/lssrad_av.out
 trace -a -o /tmp/oraix_capture/trace.bin
 mpstat -d 1 60 > /tmp/oraix_capture/mpstat_d.out
@@ -68,15 +71,18 @@ python3 oraix_report.py \
   --trace /tmp/oraix_capture/trace.out \
   --lssrad /tmp/oraix_capture/lssrad_av.out \
   --mpstat /tmp/oraix_capture/mpstat_d.out \
+  --smtctl /tmp/oraix_capture/smtctl.out \
   --output /tmp/oraix_capture/oraix_report.html
 ```
 
 The HTML report includes sortable and filterable tables for:
 
 - Findings
-- LSSRAD group summary
+- SMT topology
+- Oracle on SMT threads
 - LCPU map
-- Topology by SMT position
+- Physical cores
+- LSSRAD CPU range summary
 - SMT-position summary
 - Oracle processes
 - Trace processes by CPU
@@ -92,6 +98,7 @@ python3 oraix_report.py \
   --trace /tmp/oraix_capture/trace.out \
   --lssrad /tmp/oraix_capture/lssrad_av.out \
   --mpstat /tmp/oraix_capture/mpstat_d.out \
+  --smtctl /tmp/oraix_capture/smtctl.out \
   --format json \
   --output /tmp/oraix_capture/oraix_report.json
 ```
@@ -103,9 +110,9 @@ With `--format auto`, a `.json` output path selects JSON automatically. Other ex
 The report computes a recommendation for `vpm_throughput_mode` from the same capture window. It considers:
 
 - total `mpstat` run queue and bound values,
-- LSSRAD group run queue skew,
+- Oracle trace distribution across primary/secondary/tertiary/quaternary SMT classes,
+- capped/uncapped mode and entitlement from `mpstat`,
 - Oracle CPU Runqueue waits from `oratop`,
-- decoded AIX trace samples by LSSRAD group and SMT position,
 - remote dispatch/readiness signals.
 
 When the report recommends a controlled throughput test, it shows commands such as:
@@ -127,21 +134,24 @@ Use runtime changes first for a controlled test window. Apply persistent changes
 
 ## LCPU and Physical Core Utilization
 
-The report uses two complementary data sources:
+The report uses three complementary data sources:
 
 - `mpstat -d` describes per-LCPU pressure and dispatch behavior. Important columns include `rq`, `bound`, `cs`, `ics`, `%nsp`, `S0rd`, `S1rd`, `S3rd`, and `S3hrd`.
-- decoded AIX trace shows where Oracle processes actually ran. The report counts trace samples per LCPU, per LSSRAD group, and per inferred SMT position.
+- decoded AIX trace shows where Oracle processes actually ran. The report counts trace samples per LCPU, per physical core, and per SMT class.
+- `smtctl` supplies the SMT width. You can override it with `--smt-width {1,2,4,8}`.
 
-LSSRAD group labels are neutral names derived from CPU range order inside each `lssrad -av` SRAD row. They do not represent SMT primary/secondary/tertiary thread classes.
+SMT class calculation follows POWER/AIX LCPU numbering:
 
-The `Topology by SMT Position` table groups LCPUs by REF, SRAD, and inferred SMT position. For example, when a row contains `0-3 32-35 96-99`, SMT position `0` groups LCPUs `0`, `32`, and `96`; SMT position `1` groups `1`, `33`, and `97`.
+```text
+smt_position = lcpu % smt_width
+physical_core_id = lcpu // smt_width
+```
 
-Process, trace, and SQL tables show both dimensions:
+`lssrad -av` CPU range labels are neutral names derived from CPU range order inside each SRAD row. They do not represent SMT primary/secondary/tertiary thread classes.
 
-- `LSSRAD group`, for example `group-1:4, group-2:1`, shows how many trace samples landed in each CPU range order from `lssrad -av`.
-- `SMT position`, for example `0:3, 1:2`, shows which inferred SMT sibling positions were used.
+Process and SQL tables show dynamic columns for SMT classes, for example primary, secondary, tertiary, and quaternary for SMT-4. The JSON output includes the same counters under `smt_classes`.
 
-Use `LSSRAD Group Mapping` to translate neutral group names into actual CPU ranges for the host. Use `SMT position` columns and `SMT-Position Summary` to reason about lower versus deeper SMT sibling positions.
+Use `LSSRAD CPU Range Mapping` to translate neutral range labels into actual CPU ranges for the host. Use `Oracle on SMT Threads`, process, SQL, and `SMT-Position Summary` sections to reason about lower versus deeper SMT sibling positions.
 
 The `Active %` column is not a classic CPU busy percentage. It is Oracle trace coverage for a REF/SRAD/SMT position:
 
@@ -149,7 +159,7 @@ The `Active %` column is not a classic CPU busy percentage. It is Oracle trace c
 active LCPU threads with Oracle trace samples / available LCPU threads for that REF/SRAD/SMT position
 ```
 
-The `SMT-Position Summary` table aggregates trace samples and scheduler statistics by SMT position. This makes it easier to see whether Oracle work stayed mostly on lower SMT positions or spread into deeper SMT sibling positions during the capture window.
+The `SMT-Position Summary` table aggregates trace samples and scheduler statistics by SMT position. This makes it easier to see whether Oracle work stayed mostly on primary SMT positions or spread into deeper SMT sibling positions during the capture window.
 
 ## Notes
 

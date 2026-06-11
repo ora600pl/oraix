@@ -14,6 +14,7 @@ Options:
 
 Output files:
   lssrad_av.out
+  smtctl.out
   trace.bin
   trace.out
   mpstat_d.out
@@ -69,12 +70,16 @@ trap cleanup EXIT INT TERM
 mkdir -p "$out_dir"
 
 lssrad_file="$out_dir/lssrad_av.out"
+smtctl_file="$out_dir/smtctl.out"
 trace_bin="$out_dir/trace.bin"
 trace_report="$out_dir/trace.out"
 mpstat_file="$out_dir/mpstat_d.out"
 
 echo "Writing lssrad data to $lssrad_file"
 lssrad -av > "$lssrad_file"
+
+echo "Writing smtctl data to $smtctl_file"
+smtctl > "$smtctl_file"
 
 echo "Starting AIX trace to $trace_bin"
 trace -a -o "$trace_bin"
@@ -95,10 +100,11 @@ Collection complete.
 
 Files:
   $lssrad_file
+  $smtctl_file
   $trace_bin
   $trace_report
   $mpstat_file
 
 Example report command:
-  python3 oraix_report.py --oratop /tmp/oratop.out --trace "$trace_report" --lssrad "$lssrad_file" --mpstat "$mpstat_file" --output "$out_dir/oraix_report.html"
+  python3 oraix_report.py --oratop /tmp/oratop.out --trace "$trace_report" --lssrad "$lssrad_file" --mpstat "$mpstat_file" --smtctl "$smtctl_file" --output "$out_dir/oraix_report.html"
 EOF
