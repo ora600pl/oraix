@@ -8,6 +8,17 @@ The tool expects outputs from:
   trace -a -o /tmp/trace.out, decoded with trcrpt when not running on AIX
   lssrad -av
   mpstat -d 1 60
+  optional AIX tuning/memory context:
+    mpstat -v 1 60
+    vmstat -v
+    vmstat -s
+    vmstat 1 60
+    vmo -F -a
+    schedo -a
+    lparstat -i
+    asoo -a
+    lssrc -s aso
+    svmon -P <pmon_pid> -O mpss=on
 """
 
 from __future__ import annotations
@@ -44,10 +55,12 @@ class CpuPlacement:
     lssrad_range_index: int
     lssrad_range_label: str
     lssrad_cpu_range: str
+    srad_memory_mb: float | None = None
     smt_width: int | None = None
     smt_position: int | None = None
     physical_core_id: int | None = None
     smt_class_label: str = "unknown"
+    smt_mapping_source: str = "unknown"
 
 
 @dataclass
@@ -129,12 +142,25 @@ def parse_lssrad(text: str) -> dict[int, CpuPlacement]:
             current_ref = int(stripped)
             continue
 
-        match = re.match(r"^\s*(\d+)\s+[\d.]+\s+(.+?)\s*$", line)
-        if not match:
-            continue
-
-        srad = int(match.group(1))
-        ranges = match.group(2).split()
+        parts = stripped.split()
+        if (
+            len(parts) >= 4
+            and re.fullmatch(r"\d+", parts[0])
+            and re.fullmatch(r"\d+", parts[1])
+            and parse_number(parts[2]) is not None
+        ):
+            current_ref = int(parts[0])
+            srad = int(parts[1])
+            memory_mb = parse_number(parts[2])
+            ranges = parts[3:]
+        else:
+            match = re.match(r"^\s*(\d+)\s+([\d.]+)\s+(.+?)\s*$", line)
+            if not match:
+                continue
+            # SRAD-only lines inherit the latest REF, including one set by a combined REF/SRAD/MEM/ranges line.
+            srad = int(match.group(1))
+            memory_mb = parse_number(match.group(2))
+            ranges = match.group(3).split()
         for index, cpu_range in enumerate(ranges, start=1):
             label = f"range-{index}"
             for lcpu in expand_cpu_group(cpu_range):
@@ -145,21 +171,36 @@ def parse_lssrad(text: str) -> dict[int, CpuPlacement]:
                     lssrad_range_index=index,
                     lssrad_range_label=label,
                     lssrad_cpu_range=cpu_range,
+                    srad_memory_mb=memory_mb,
                 )
     return placements
 
 
-def apply_smt_topology(placements: dict[int, CpuPlacement], smt_width: int | None) -> None:
+def apply_smt_topology(
+    placements: dict[int, CpuPlacement],
+    smt_width: int | None,
+    smtctl_info: dict[str, object] | None = None,
+) -> None:
+    lcpu_to_core = smtctl_info.get("lcpu_to_core", {}) if smtctl_info else {}
+    lcpu_to_position = smtctl_info.get("lcpu_to_position", {}) if smtctl_info else {}
+    has_bindmap = bool(smtctl_info and smtctl_info.get("has_bindmap"))
     for placement in placements.values():
         placement.smt_width = smt_width
-        if smt_width is None:
+        if has_bindmap and placement.lcpu in lcpu_to_core and placement.lcpu in lcpu_to_position:
+            placement.smt_position = int(lcpu_to_position[placement.lcpu])
+            placement.physical_core_id = int(lcpu_to_core[placement.lcpu])
+            placement.smt_class_label = smt_class_label(placement.smt_position)
+            placement.smt_mapping_source = "smtctl-bindmap"
+        elif smt_width is None:
             placement.smt_position = None
             placement.physical_core_id = None
             placement.smt_class_label = "unknown"
-            continue
-        placement.smt_position = placement.lcpu % smt_width
-        placement.physical_core_id = placement.lcpu // smt_width
-        placement.smt_class_label = smt_class_label(placement.smt_position)
+            placement.smt_mapping_source = "unknown"
+        else:
+            placement.smt_position = placement.lcpu % smt_width
+            placement.physical_core_id = placement.lcpu // smt_width
+            placement.smt_class_label = smt_class_label(placement.smt_position)
+            placement.smt_mapping_source = "heuristic"
 
 
 def parse_smtctl(text: str) -> dict[str, object]:
@@ -167,6 +208,8 @@ def parse_smtctl(text: str) -> dict[str, object]:
     capable: bool | None = None
     widths: list[int] = []
     per_proc: dict[str, int] = {}
+    lcpu_to_proc: dict[int, str] = {}
+    proc_threads: dict[str, list[int]] = defaultdict(list)
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -179,10 +222,18 @@ def parse_smtctl(text: str) -> dict[str, object]:
         elif re.search(r"\bsmt\s+capable\b", lower):
             capable = True
 
-        if re.search(r"\bsmt\b.*\b(disabled|off)\b|\b(disabled|off)\b.*\bsmt\b", lower):
-            enabled = False
-        elif re.search(r"\bsmt\b.*\b(enabled|on)\b|\b(enabled|on)\b.*\bsmt\b", lower):
-            enabled = True
+        if "boot mode" not in lower:
+            if re.search(r"\bsmt\s+is\s+currently\s+(disabled|off)\b|\bsmt\s+mode\s*:\s*(disabled|off)\b", lower):
+                enabled = False
+            elif re.search(r"\bsmt\s+is\s+currently\s+(enabled|on)\b|\bsmt\s+mode\s*:\s*(enabled|on)\b", lower):
+                enabled = True
+
+        bind_match = re.search(r"\bBind\s+processor\s+(\d+)\s+is\s+bound\s+with\s+(proc\d+)\b", line, re.IGNORECASE)
+        if bind_match:
+            lcpu = int(bind_match.group(1))
+            proc = bind_match.group(2).lower()
+            lcpu_to_proc[lcpu] = proc
+            proc_threads[proc].append(lcpu)
 
         proc_match = re.search(r"\b(proc\d+)\b", line, re.IGNORECASE)
         width_match = (
@@ -204,6 +255,19 @@ def parse_smtctl(text: str) -> dict[str, object]:
     else:
         smt_width = None
 
+    sorted_proc_threads = {proc: sorted(set(lcpus)) for proc, lcpus in proc_threads.items()}
+    sorted_procs = sorted(
+        sorted_proc_threads,
+        key=lambda proc: (min(sorted_proc_threads[proc]), int(proc[4:]) if proc[4:].isdigit() else proc),
+    )
+    proc_to_core = {proc: core_id for core_id, proc in enumerate(sorted_procs)}
+    lcpu_to_core: dict[int, int] = {}
+    lcpu_to_position: dict[int, int] = {}
+    for proc, threads in sorted_proc_threads.items():
+        for position, lcpu in enumerate(threads):
+            lcpu_to_core[lcpu] = proc_to_core[proc]
+            lcpu_to_position[lcpu] = position
+
     mixed = len(set(per_proc.values())) > 1 if per_proc else len(set(widths)) > 1
     return {
         "smt_width": smt_width,
@@ -212,6 +276,11 @@ def parse_smtctl(text: str) -> dict[str, object]:
         "smt_width_per_proc": per_proc,
         "smt_width_mixed": mixed,
         "raw_widths": widths,
+        "lcpu_to_proc": lcpu_to_proc,
+        "proc_threads": sorted_proc_threads,
+        "lcpu_to_core": lcpu_to_core,
+        "lcpu_to_position": lcpu_to_position,
+        "has_bindmap": bool(lcpu_to_proc),
     }
 
 
@@ -271,9 +340,25 @@ def resolve_smt_topology(
     if source not in {"cli", "smtctl"} and not warnings:
         warnings.append("SMT width source is not authoritative; SMT position interpretation may be uncertain.")
 
+    has_bindmap = bool(smtctl_info and smtctl_info.get("has_bindmap"))
+    bindmap_lcpus = set((smtctl_info or {}).get("lcpu_to_core", {}).keys())
+    placement_lcpus = set(placements)
+    any_heuristic_mapping = bool(width is not None and placement_lcpus and (not has_bindmap or not placement_lcpus <= bindmap_lcpus))
+    if has_bindmap and placement_lcpus and placement_lcpus <= bindmap_lcpus:
+        smt_mapping_source = "smtctl-bindmap"
+    elif width is not None:
+        smt_mapping_source = "heuristic"
+    else:
+        smt_mapping_source = "unknown"
+    if any_heuristic_mapping:
+        warnings.append(
+            "LCPU->core mapping is heuristic and may be wrong when smtctl bind-map is unavailable or LCPU numbering is non-contiguous"
+        )
+
     return {
         "smt_width": width,
         "smt_width_source": source,
+        "smt_mapping_source": smt_mapping_source,
         "smtctl": smtctl_info or {},
         "warnings": warnings,
         "smt_classes": smt_class_labels(width),
@@ -287,6 +372,32 @@ def parse_number(token: str) -> float | None:
         return float(token)
     except ValueError:
         return None
+
+
+def parse_size_to_mb(token: str) -> float | None:
+    cleaned = token.strip().replace(",", "")
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([kmgtp]?)(?:b)?", cleaned, re.IGNORECASE)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    multiplier = {
+        "": 1.0,
+        "k": 1.0 / 1024.0,
+        "m": 1.0,
+        "g": 1024.0,
+        "t": 1024.0 * 1024.0,
+        "p": 1024.0 * 1024.0 * 1024.0,
+    }[unit]
+    return value * multiplier
+
+
+def as_float(value: object | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return parse_number(str(value))
 
 
 def parse_mpstat(text: str) -> tuple[dict[int, MpstatCpu], dict[str, str], set[str]]:
@@ -323,6 +434,169 @@ def parse_mpstat(text: str) -> tuple[dict[int, MpstatCpu], dict[str, str], set[s
         cpu = int(parts[0])
         cpus.setdefault(cpu, MpstatCpu(cpu=cpu)).samples.append(row)
     return cpus, config, columns
+
+
+def parse_tunables(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "Command not found" in line:
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().split()[0] if value.strip() else ""
+        else:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            key, value = parts[0], parts[1]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            values[key.lower()] = value
+    return values
+
+
+def parse_lparstat(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line or line.startswith("#"):
+            continue
+        key, value = line.split(":", 1)
+        normalized = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
+        values[normalized] = value.strip()
+    return values
+
+
+def parse_vmstat_v(text: str) -> dict[str, float | int | str]:
+    patterns = {
+        "memory_pools": r"(\d+)\s+memory\s+pools?",
+        "numperm_percent": r"([0-9.]+)\s+numperm\s+percentage",
+        "minperm_percent": r"([0-9.]+)\s+minperm\s+percentage",
+        "maxperm_percent": r"([0-9.]+)\s+maxperm\s+percentage",
+        "client_percent": r"([0-9.]+)\s+client\s+percentage",
+        "maxclient_percent": r"([0-9.]+)\s+maxclient\s+percentage",
+        "compressed_percent": r"([0-9.]+)\s+compressed\s+percentage",
+    }
+    values: dict[str, float | int | str] = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            number = parse_number(match.group(1))
+            if number is not None:
+                values[key] = int(number) if number.is_integer() else number
+    return values
+
+
+def parse_vmstat_s(text: str) -> dict[str, int]:
+    patterns = {
+        "free_frame_waits": r"(\d+)\s+free\s+frame\s+waits",
+        "pages_paged_in": r"(\d+)\s+pages\s+paged\s+in",
+        "pages_paged_out": r"(\d+)\s+pages\s+paged\s+out",
+        "paging_space_page_ins": r"(\d+)\s+paging\s+space\s+page\s+ins",
+        "paging_space_page_outs": r"(\d+)\s+paging\s+space\s+page\s+outs",
+        "revolutions_of_clock_hand": r"(\d+)\s+revolutions\s+of\s+the\s+clock\s+hand",
+        "page_steals": r"(\d+)\s+page\s+steals",
+    }
+    values: dict[str, int] = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            values[key] = int(match.group(1))
+    return values
+
+
+def parse_vmstat_interval(text: str) -> dict[str, float | None]:
+    header: list[str] = []
+    rows: list[dict[str, float | None]] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if {"fre", "pi", "po"}.issubset(set(parts)):
+            header = parts
+            continue
+        if not header or len(parts) != len(header):
+            continue
+        if not all(re.fullmatch(r"-?\d+(?:\.\d+)?", part) for part in parts):
+            continue
+        rows.append({key: parse_number(value) for key, value in zip(header, parts)})
+
+    result: dict[str, float | None] = {}
+    for key in ("fre", "pi", "po", "sr", "r", "b"):
+        values = [row[key] for row in rows if row.get(key) is not None]
+        if values:
+            result[f"{key}_avg"] = mean(values)
+            result[f"{key}_max"] = max(values)
+    return result
+
+
+def parse_oratop_summary(text: str) -> dict[str, object]:
+    summary: dict[str, object] = {}
+    for line in text.splitlines():
+        if "Oracle " in line and " sga" in line.lower():
+            sga_match = re.search(r"\b([0-9.]+[KMGTPE]?)(?:B)?\s+sga\b", line, re.IGNORECASE)
+            if sga_match:
+                summary["sga_mb"] = parse_size_to_mb(sga_match.group(1))
+                summary["sga_text"] = sga_match.group(1)
+            db_match = re.search(r"\b([0-9.]+[KMGTPE]?)(?:B)?\s+sz\b", line, re.IGNORECASE)
+            if db_match:
+                summary["database_size_mb"] = parse_size_to_mb(db_match.group(1))
+                summary["database_size_text"] = db_match.group(1)
+            dbt_match = re.search(r"\b([0-9.]+)%db\b", line, re.IGNORECASE)
+            if dbt_match:
+                summary["db_time_percent"] = parse_number(dbt_match.group(1))
+            summary["database_header"] = line.strip()
+            continue
+        if re.match(r"^\s*\d+\s+\d+\s+", line):
+            parts = line.split()
+            # oratop database summary row: ID CPU %CPU LOAD AAS ...
+            if len(parts) > 18:
+                summary.update(
+                    {
+                        "logical_cpu_count": parse_number(parts[1]),
+                        "summary_cpu_percent": parse_number(parts[2]),
+                        "load": parse_number(parts[3]),
+                        "aas": parse_number(parts[4]),
+                        "pga_text": parts[18],
+                        "pga_mb": parse_size_to_mb(parts[18]),
+                    }
+                )
+                break
+    return summary
+
+
+def parse_oracle_params(text: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.lower().startswith(("name", "---")):
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+        else:
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                continue
+            key = parts[0]
+            value = parts[-1]
+        key = key.strip().lower()
+        if re.fullmatch(r"[a-z][a-z0-9_$#]*", key):
+            params[key] = value.strip()
+    return params
+
+
+def parse_svmon_summary(text: str) -> dict[str, object]:
+    sizes = Counter()
+    for match in re.finditer(r"\b(4K|64K|16M|16G)\b", text, re.IGNORECASE):
+        sizes[match.group(1).upper()] += 1
+    return {
+        "page_size_mentions": counter_to_dict(sizes),
+        "mpss_visible": "mpss" in text.lower(),
+        "large_page_visible": bool(re.search(r"\b16M\b|\b16G\b|\bL\b", text, re.IGNORECASE)),
+        "raw_available": bool(text.strip()) and "PMON PID was not provided" not in text,
+    }
 
 
 def is_probably_text(path: Path) -> bool:
@@ -709,6 +983,8 @@ def smt_position_stats(
                 "nsp_avg": stats["nsp"],
                 "s2rd": stats["s2rd"],
                 "s3rd": stats["s3rd"],
+                "s4rd": stats["s4rd"],
+                "s5rd": stats["s5rd"],
                 "s3hrd": stats["s3hrd"],
                 "s4hrd": stats["s4hrd"],
                 "s5hrd": stats["s5hrd"],
@@ -767,6 +1043,7 @@ def physical_core_stats(
         samples_by_class: dict[str, int] = {label: 0 for label in smt_class_labels(smt_width)}
         srads = sorted({placement.srad for placement in core_placements})
         refs = sorted({placement.ref for placement in core_placements if placement.ref is not None})
+        mapping_sources = sorted({placement.smt_mapping_source for placement in core_placements})
         for placement in core_placements:
             lcpus_by_class[placement.smt_class_label] = placement.lcpu
             samples_by_class[placement.smt_class_label] = trace_counts.get(placement.lcpu, 0)
@@ -775,6 +1052,7 @@ def physical_core_stats(
         rows.append(
             {
                 "physical_core_id": core_id,
+                "smt_mapping_source": ",".join(mapping_sources),
                 "ref": ",".join(str(ref) for ref in refs) if refs else "-",
                 "srad": ",".join(str(srad) for srad in srads),
                 "lcpus_by_smt_class": lcpus_by_class,
@@ -788,6 +1066,522 @@ def physical_core_stats(
             }
         )
     return sorted(rows, key=lambda row: (int(row["trace_samples"]), float(row["rq_total"] or 0.0)), reverse=True)
+
+
+def memory_topology_summary(
+    placements: dict[int, CpuPlacement],
+    smt_width: int | None,
+) -> dict[str, object]:
+    grouped: dict[tuple[int | None, int], dict[str, object]] = {}
+    for placement in placements.values():
+        key = (placement.ref, placement.srad)
+        row = grouped.setdefault(
+            key,
+            {
+                "ref": placement.ref,
+                "srad": placement.srad,
+                "memory_mb": placement.srad_memory_mb,
+                "lcpus": set(),
+                "ranges": set(),
+                "physical_cores": set(),
+            },
+        )
+        row["lcpus"].add(placement.lcpu)
+        row["ranges"].add(placement.lssrad_cpu_range)
+        if placement.physical_core_id is not None:
+            row["physical_cores"].add(placement.physical_core_id)
+
+    rows = []
+    for row in grouped.values():
+        lcpus = sorted(row["lcpus"])
+        cores = sorted(row["physical_cores"])
+        memory_mb = as_float(row["memory_mb"])
+        rows.append(
+            {
+                "ref": row["ref"],
+                "srad": row["srad"],
+                "memory_mb": memory_mb,
+                "memory_gb": (memory_mb / 1024.0) if memory_mb is not None else None,
+                "lcpu_count": len(lcpus),
+                "physical_core_count": len(cores) if cores else (len(lcpus) / smt_width if smt_width else None),
+                "memory_mb_per_lcpu": (memory_mb / len(lcpus)) if memory_mb is not None and lcpus else None,
+                "memory_mb_per_physical_core": (
+                    memory_mb / len(cores)
+                    if memory_mb is not None and cores
+                    else (memory_mb / (len(lcpus) / smt_width) if memory_mb is not None and smt_width and lcpus else None)
+                ),
+                "lcpus": lcpus,
+                "ranges": sorted(row["ranges"]),
+            }
+        )
+
+    memory_values = [float(row["memory_mb"]) for row in rows if row.get("memory_mb") is not None]
+    ratio = (max(memory_values) / min(memory_values)) if memory_values and min(memory_values) > 0 else None
+    level = "ok"
+    title = "SRAD memory appears balanced"
+    interpretation = "lssrad reports memory attached to each SRAD. Balance is evaluated across SRAD memory sizes."
+    if not memory_values:
+        level = "info"
+        title = "SRAD memory was not available"
+        interpretation = "The lssrad parser did not find memory values, so only CPU topology can be interpreted."
+    elif ratio is not None and ratio >= 1.25:
+        level = "warning"
+        title = "SRAD memory allocation is uneven"
+        interpretation = (
+            f"Maximum SRAD memory is {ratio:.2f}x the minimum. Oracle SGA is typically striped across available LPAR memory; "
+            "uneven CPU/memory topology can amplify local/near/far memory effects."
+        )
+
+    return {
+        "level": level,
+        "title": title,
+        "interpretation": interpretation,
+        "imbalance_ratio": ratio,
+        "rows": sorted(rows, key=lambda row: (row["ref"] if row["ref"] is not None else -1, row["srad"])),
+    }
+
+
+def diagnose_affinity(
+    stats: dict[str, dict[str, float | int | None]],
+    smt_stats: list[dict[str, object]],
+    remote_rd_threshold: float,
+    local_hrd_threshold: float,
+) -> dict[str, object]:
+    range_rows = []
+    for label, values in stats.items():
+        s3rd = as_float(values.get("s3rd"))
+        s4rd = as_float(values.get("s4rd"))
+        s5rd = as_float(values.get("s5rd"))
+        s3hrd = as_float(values.get("s3hrd"))
+        s4hrd = as_float(values.get("s4hrd"))
+        s5hrd = as_float(values.get("s5hrd"))
+        remote_redispatch = none_sum((s4rd, s5rd))
+        non_local_memory = none_sum((s4hrd, s5hrd))
+        if non_local_memory is None and s3hrd is not None:
+            non_local_memory = max(0.0, 100.0 - s3hrd)
+        score = 100.0
+        if remote_redispatch is not None:
+            score -= min(40.0, remote_redispatch * 2.0)
+        if s3hrd is not None:
+            score -= max(0.0, local_hrd_threshold - s3hrd)
+        elif non_local_memory is not None:
+            score -= min(30.0, non_local_memory)
+        range_rows.append(
+            {
+                "lssrad_range_label": label,
+                "s3rd": s3rd,
+                "s4rd": s4rd,
+                "s5rd": s5rd,
+                "s3hrd": s3hrd,
+                "s4hrd": s4hrd,
+                "s5hrd": s5hrd,
+                "remote_redispatch": remote_redispatch,
+                "non_local_memory": non_local_memory,
+                "s0rd": as_float(values.get("s0rd")),
+                "s1rd": as_float(values.get("s1rd")),
+                "nsp": as_float(values.get("nsp")),
+                "affinity_score": max(0.0, min(100.0, score)),
+            }
+        )
+
+    elevated = [
+        row
+        for row in range_rows
+        if (row["remote_redispatch"] is not None and row["remote_redispatch"] >= remote_rd_threshold)
+        or (row["s3hrd"] is not None and row["s3hrd"] < local_hrd_threshold)
+        or (row["s5hrd"] is not None and row["s5hrd"] >= max(0.0, 100.0 - local_hrd_threshold))
+    ]
+    level = "ok" if not elevated else "warning"
+    title = "CPU/memory affinity looks acceptable" if not elevated else "Remote redispatch or non-local memory is visible"
+    interpretation = (
+        "mpstat -d S3rd is same-chip redispatch and is not penalized. Scores use S4rd+S5rd for remote redispatch "
+        "and S3hrd/S4hrd/S5hrd for local/near/far home-SRAD dispatch."
+    )
+    if elevated:
+        worst = sorted(elevated, key=lambda row: (row["affinity_score"], -(row["remote_redispatch"] or 0.0)))[0]
+        interpretation = (
+            f"{worst['lssrad_range_label']} has the weakest affinity score ({worst['affinity_score']:.1f}). "
+            "Review S4rd+S5rd for remote redispatch and S3hrd/S4hrd/S5hrd for local/near/far home-SRAD dispatch."
+        )
+
+    return {
+        "level": level,
+        "title": title,
+        "interpretation": interpretation,
+        "range_rows": sorted(range_rows, key=lambda row: row["affinity_score"]),
+        "smt_rows": smt_stats,
+    }
+
+
+def diagnose_memory_pressure(
+    vmstat_v: dict[str, float | int | str],
+    vmstat_s: dict[str, int],
+    vmstat_interval: dict[str, float | None],
+    vmo: dict[str, str],
+    placements: dict[int, CpuPlacement],
+) -> dict[str, object]:
+    free_frame_waits = vmstat_s.get("free_frame_waits", 0)
+    paging_outs = vmstat_s.get("paging_space_page_outs", 0) or vmstat_s.get("pages_paged_out", 0)
+    pi_avg = as_float(vmstat_interval.get("pi_avg"))
+    po_avg = as_float(vmstat_interval.get("po_avg"))
+    fre_avg = as_float(vmstat_interval.get("fre_avg"))
+    pools = as_float(vmstat_v.get("memory_pools"))
+    minfree = as_float(vmo.get("minfree"))
+    maxfree = as_float(vmo.get("maxfree"))
+    maxpgahead = as_float(vmo.get("maxpgahead"))
+    j2_read_ahead = as_float(vmo.get("j2_maxpagereadahead") or vmo.get("j2_maxPageReadAhead"))
+    lcpu = len(placements)
+
+    expected_minfree = None
+    expected_maxfree = None
+    if pools and pools > 0:
+        expected_minfree = max(960.0, 120.0 * lcpu) / pools
+        read_ahead = max(value for value in (maxpgahead or 0.0, j2_read_ahead or 0.0, 0.0))
+        expected_maxfree = expected_minfree + (read_ahead * lcpu) / pools if read_ahead else None
+
+    evidence = []
+    if vmstat_s:
+        evidence.append(f"vmstat -s: free frame waits={free_frame_waits}, paging-space/page outs={paging_outs}.")
+    if vmstat_interval:
+        evidence.append(
+            f"vmstat interval averages: fre={fmt(fre_avg)}, pi={fmt(pi_avg)}, po={fmt(po_avg)}."
+        )
+    if pools:
+        evidence.append(f"vmstat -v reports {fmt(pools, 0)} memory pools.")
+    if minfree is not None or maxfree is not None:
+        evidence.append(f"vmo minfree={fmt(minfree, 0)}, maxfree={fmt(maxfree, 0)}.")
+    if expected_minfree is not None:
+        evidence.append(
+            f"Oracle starting-point heuristic from the IBM deck: minfree about {expected_minfree:.0f}"
+            + (f", maxfree about {expected_maxfree:.0f}." if expected_maxfree is not None else ".")
+        )
+
+    level = "ok"
+    title = "No AIX memory pressure signal in supplied optional files"
+    interpretation = "The supplied vmstat/vmo files do not show paging-space pressure or free-frame waits."
+    if not vmstat_s and not vmstat_interval and not vmstat_v and not vmo:
+        level = "info"
+        title = "Memory pressure context was not supplied"
+        interpretation = "Provide vmstat -v, vmstat -s, vmstat interval, and vmo output to assess VMM/lrud pressure."
+    elif free_frame_waits > 0 or paging_outs > 0 or (po_avg is not None and po_avg > 0):
+        level = "critical"
+        title = "AIX memory pressure or paging is visible"
+        interpretation = (
+            "Oracle database LPARs should treat paging-space activity as a problem signal. "
+            "Check SGA/PGA sizing, pinned memory, and free page thresholds before accepting sustained paging."
+        )
+    elif minfree is not None and expected_minfree is not None and minfree < expected_minfree * 0.75:
+        level = "warning"
+        title = "minfree is below the Oracle-oriented starting point"
+        interpretation = "The configured minfree is materially below the slide-deck heuristic for this LCPU/pool count."
+
+    return {
+        "level": level,
+        "title": title,
+        "interpretation": interpretation,
+        "evidence": evidence,
+        "vmstat_v": vmstat_v,
+        "vmstat_s": vmstat_s,
+        "vmstat_interval": vmstat_interval,
+        "vmo_subset": {key: vmo.get(key) for key in ("minfree", "maxfree", "maxpgahead", "lgpg_regions", "lgpg_size", "v_pinshm", "vmm_klock_mode")},
+        "expected_minfree": expected_minfree,
+        "expected_maxfree": expected_maxfree,
+    }
+
+
+def diagnose_oracle_memory_pages(
+    oratop_summary: dict[str, object],
+    oracle_params: dict[str, str],
+    vmo: dict[str, str],
+    asoo: dict[str, str],
+    aso_status_text: str,
+    svmon: dict[str, object],
+) -> dict[str, object]:
+    sga_mb = as_float(oratop_summary.get("sga_mb"))
+    lgpg_regions = as_float(vmo.get("lgpg_regions"))
+    lgpg_size = as_float(vmo.get("lgpg_size"))
+    v_pinshm = vmo.get("v_pinshm")
+    klock = vmo.get("vmm_klock_mode")
+    aso_active = asoo.get("aso_active")
+    large_page_utilization = asoo.get("large_page_utilization")
+    base_large_pages = int((sga_mb - 1) // 16) + 1 if sga_mb and sga_mb > 0 else None
+    lock_sga_large_pages = base_large_pages + 3 if base_large_pages is not None else None
+    needed_large_pages = lock_sga_large_pages
+    lock_sga = oracle_params.get("lock_sga")
+    sga_max_size = oracle_params.get("sga_max_size")
+    sga_target = oracle_params.get("sga_target")
+    memory_target = oracle_params.get("memory_target")
+    memory_max_target = oracle_params.get("memory_max_target")
+
+    evidence = []
+    if sga_mb is not None:
+        evidence.append(f"oratop reports SGA={fmt(sga_mb / 1024.0)} GB.")
+    if lgpg_regions is not None or lgpg_size is not None:
+        evidence.append(f"vmo lgpg_regions={fmt(lgpg_regions, 0)}, lgpg_size={fmt(lgpg_size, 0)}.")
+    if needed_large_pages is not None:
+        evidence.append(
+            "16MB large-page sizing: "
+            f"base INT[(SGA-1)/16MB]+1 = {base_large_pages} regions; "
+            f"LOCK_SGA recommendation adds 3 = {lock_sga_large_pages} regions."
+        )
+    if v_pinshm is not None:
+        evidence.append(f"vmo v_pinshm={v_pinshm}.")
+    if klock is not None:
+        evidence.append(f"vmo vmm_klock_mode={klock}.")
+    if aso_active is not None or large_page_utilization is not None:
+        evidence.append(f"asoo aso_active={aso_active or 'n/a'}, large_page_utilization={large_page_utilization or 'n/a'}.")
+    if svmon.get("raw_available"):
+        evidence.append(f"svmon page-size mentions: {svmon.get('page_size_mentions', {})}.")
+    if aso_status_text.strip():
+        evidence.append("aso subsystem status was supplied.")
+    if oracle_params:
+        evidence.append(
+            "Oracle params: "
+            + ", ".join(
+                f"{key}={value}"
+                for key, value in (
+                    ("lock_sga", lock_sga),
+                    ("sga_max_size", sga_max_size),
+                    ("sga_target", sga_target),
+                    ("memory_target", memory_target),
+                    ("memory_max_target", memory_max_target),
+                )
+                if value is not None
+            )
+        )
+
+    level = "info"
+    title = "Oracle SGA page-size context is partial"
+    interpretation = "Provide vmo/asoo/svmon and Oracle parameter output for a complete large-page interpretation."
+    page_context_supplied = bool(vmo or asoo or oracle_params or svmon.get("raw_available"))
+    if (
+        page_context_supplied
+        and sga_mb is not None
+        and sga_mb >= 100 * 1024
+        and not svmon.get("large_page_visible")
+        and not lgpg_regions
+    ):
+        level = "warning"
+        title = "Large SGA without visible 16MB page evidence"
+        interpretation = (
+            "The IBM guidance recommends evaluating 16MB pages for SGA larger than about 100GB. "
+            "No 16MB large-page evidence was visible in the supplied optional files."
+        )
+    elif lgpg_regions and needed_large_pages and lgpg_regions < needed_large_pages:
+        level = "warning"
+        title = "Configured large-page regions appear below SGA sizing rule"
+        interpretation = "Configured lgpg_regions is lower than the 16MB-page rule of thumb for the reported SGA."
+    elif svmon.get("large_page_visible") or lgpg_regions:
+        level = "ok"
+        title = "Large-page/SGA evidence is present"
+        interpretation = "The optional files contain 16MB/large-page evidence; verify it maps to the Oracle SGA segments."
+
+    if lock_sga and lock_sga.lower() == "true" and sga_max_size and not lgpg_regions and not svmon.get("large_page_visible"):
+        level = "warning"
+        title = "LOCK_SGA is true without visible large-page evidence"
+        interpretation = (
+            "LOCK_SGA=true pre-allocates/pins SGA memory. The IBM guidance strongly prefers explicit page-size planning, "
+            "especially for large SGAs."
+        )
+    amm_values = [value for value in (memory_target, memory_max_target) if value is not None]
+    if any(value not in {"0", "0.0"} for value in amm_values):
+        evidence.append("AMM is configured; size 16MB large pages against MEMORY_MAX_TARGET rather than only SGA.")
+
+    kernel_level = "ok"
+    if klock is not None and str(klock) != "2" and (lgpg_regions or svmon.get("large_page_visible")):
+        kernel_level = "warning"
+        evidence.append("Pinned or large SGA evidence exists while vmm_klock_mode is not 2.")
+
+    dso_level = "info"
+    if aso_active == "1":
+        dso_level = "ok"
+    elif aso_active is not None:
+        dso_level = "warning"
+        evidence.append("DSO/ASO is not active; MPSS conversion benefits may be unavailable.")
+
+    return {
+        "level": "warning" if kernel_level == "warning" or dso_level == "warning" else level,
+        "title": title,
+        "interpretation": interpretation,
+        "kernel_pinning_level": kernel_level,
+        "dso_level": dso_level,
+        "evidence": evidence,
+        "oratop_summary": oratop_summary,
+        "oracle_params": oracle_params,
+        "needed_16mb_large_pages": needed_large_pages,
+        "base_16mb_large_pages": base_large_pages,
+        "lock_sga_16mb_large_pages": lock_sga_large_pages,
+        "vmo_subset": {
+            "lgpg_regions": vmo.get("lgpg_regions"),
+            "lgpg_size": vmo.get("lgpg_size"),
+            "v_pinshm": v_pinshm,
+            "vmm_klock_mode": klock,
+        },
+        "asoo_subset": {
+            "aso_active": aso_active,
+            "large_page_utilization": large_page_utilization,
+        },
+        "svmon": svmon,
+    }
+
+
+def diagnose_lpar_sizing(
+    mp_config: dict[str, str],
+    lparstat: dict[str, str],
+    smt_width: int | None,
+    placements: dict[int, CpuPlacement],
+) -> dict[str, object]:
+    entitlement = as_float(mp_config.get("ent")) or as_float(lparstat.get("entitled_capacity"))
+    lcpu = as_float(mp_config.get("lcpu")) or float(len(placements) or 0)
+    virtual_processors = as_float(lparstat.get("online_virtual_cpus")) or as_float(lparstat.get("maximum_virtual_cpus"))
+    if virtual_processors is None and smt_width:
+        virtual_processors = lcpu / smt_width
+    ratio = (virtual_processors / entitlement) if virtual_processors and entitlement else None
+
+    evidence = [
+        f"lcpu={fmt(lcpu, 0)}, smt_width={fmt(smt_width, 0)}, entitlement={fmt(entitlement)}, virtual_processors={fmt(virtual_processors)}."
+    ]
+    mode = mp_config.get("mode") or lparstat.get("type")
+    if mode:
+        evidence.append(f"LPAR mode/type={mode}.")
+
+    level = "ok"
+    title = "LPAR VP entitlement ratio is within the common Oracle guideline"
+    interpretation = "The IBM guidance suggests keeping configured virtual processors close to entitlement, commonly not above about 1.5x-2x."
+    if ratio is None:
+        level = "info"
+        title = "LPAR sizing context is partial"
+        interpretation = "Provide lparstat -i or reliable mpstat configuration to evaluate VP/entitlement ratio."
+    elif ratio > 2.0:
+        level = "warning"
+        title = "Virtual processors are high relative to entitlement"
+        interpretation = f"VP/entitlement ratio is {ratio:.2f}; this is above the 2x upper guideline and can make folding/dispatch behavior harder to reason about."
+    elif ratio > 1.5:
+        level = "info"
+        title = "Virtual processors are above 1.5x entitlement"
+        interpretation = f"VP/entitlement ratio is {ratio:.2f}; this may be acceptable, but it deserves review for Oracle CPU placement."
+
+    return {
+        "level": level,
+        "title": title,
+        "interpretation": interpretation,
+        "evidence": evidence,
+        "vp_to_entitlement_ratio": ratio,
+        "lparstat": lparstat,
+    }
+
+
+def diagnose_extended_vpm(
+    base_diagnosis: dict[str, object],
+    schedo: dict[str, str],
+    mpstat_v_text: str,
+    lpar_sizing: dict[str, object],
+) -> dict[str, object]:
+    evidence = list(base_diagnosis.get("evidence", []))
+    for key in ("vpm_xvcpus", "vpm_fold_policy", "vpm_throughput_mode", "vpm_throughput_core_threshold"):
+        if key in schedo:
+            evidence.append(f"schedo {key}={schedo[key]}.")
+    if mpstat_v_text.strip():
+        evidence.append("mpstat -v was supplied for virtual processor dispatch/activity review.")
+
+    level = str(base_diagnosis.get("level", "info"))
+    title = str(base_diagnosis.get("title", "Extended VP folding context"))
+    interpretation = str(base_diagnosis.get("interpretation", ""))
+    vpm_xvcpus = schedo.get("vpm_xvcpus")
+    core_threshold = schedo.get("vpm_throughput_core_threshold")
+
+    if vpm_xvcpus == "-1":
+        level = "warning"
+        title = "VP folding appears disabled"
+        interpretation = "vpm_xvcpus=-1 disables folding. The IBM guidance prefers folding active for Oracle DB LPARs except during controlled tests."
+    elif vpm_xvcpus is not None and as_float(vpm_xvcpus) is not None and as_float(vpm_xvcpus) < 2:
+        level = "info"
+        title = "vpm_xvcpus is below the common Oracle/RAC floor"
+        interpretation = "For RAC, the IBM guidance calls out vpm_xvcpus=2 as a minimum. For non-RAC, keep this as context rather than a hard finding."
+    elif core_threshold == "0":
+        title = "vpm_throughput_core_threshold=0 is configured"
+        interpretation = (
+            "This special case can speed unfolding up to the configured raw-throughput threshold. "
+            "Review alongside shared-pool competition and entitlement."
+        )
+
+    ratio = as_float(lpar_sizing.get("vp_to_entitlement_ratio"))
+    if ratio is not None and ratio > 2.0:
+        evidence.append("VP/entitlement ratio is above 2x, which can interact with folding decisions.")
+
+    return {
+        "level": level,
+        "title": title,
+        "interpretation": interpretation,
+        "recommended_value": base_diagnosis.get("recommended_value"),
+        "commands": base_diagnosis.get("commands", {}),
+        "evidence": evidence,
+        "schedo_subset": {key: schedo.get(key) for key in ("vpm_xvcpus", "vpm_fold_policy", "vpm_throughput_mode", "vpm_throughput_core_threshold")},
+    }
+
+
+def diagnose_thread_constraints(
+    trace_by_pid: dict[int, TraceThread],
+    processes: dict[int, OracleProcess],
+    placements: dict[int, CpuPlacement],
+    smt_width: int | None,
+) -> dict[str, object]:
+    rows = []
+    for pid, trace in trace_by_pid.items():
+        if trace.samples < 10 or not trace.cpus:
+            continue
+        top_cpu, top_cpu_samples = trace.cpus.most_common(1)[0]
+        top_lcpu_percent = top_cpu_samples / trace.samples * 100.0
+        core_counts: Counter[int] = Counter()
+        for cpu, samples in trace.cpus.items():
+            placement = placements.get(cpu)
+            if placement and placement.physical_core_id is not None:
+                core_counts[placement.physical_core_id] += samples
+        top_core_percent = 0.0
+        top_core = None
+        if core_counts:
+            top_core, top_core_samples = core_counts.most_common(1)[0]
+            top_core_percent = top_core_samples / trace.samples * 100.0
+        if top_lcpu_percent >= 80.0 or top_core_percent >= 90.0:
+            proc = processes.get(pid, OracleProcess(pid=pid))
+            rows.append(
+                {
+                    "pid": pid,
+                    "name": proc.name or trace.name,
+                    "sql_id": proc.sql_id,
+                    "samples": trace.samples,
+                    "top_lcpu": top_cpu,
+                    "top_lcpu_percent": top_lcpu_percent,
+                    "top_physical_core": top_core,
+                    "top_physical_core_percent": top_core_percent,
+                    "oratop_cpu": proc.oratop_cpu,
+                    "wait_class": proc.wait_class,
+                    "event": proc.event,
+                }
+            )
+
+    level = "ok"
+    title = "No strong single-thread concentration detected"
+    interpretation = (
+        "Oracle trace samples are not dominated by a single LCPU/core for the sampled processes. "
+        "This does not rule out SQL-level serialization, but no obvious thread-constraint signature was found."
+    )
+    if rows:
+        level = "info"
+        title = "Possible process/thread constraint candidates"
+        interpretation = (
+            "Some Oracle processes have trace samples concentrated on one LCPU or one physical core. "
+            "On SMT systems, a process can be thread-constrained even when tool-reported CPU is well below 100%."
+        )
+    if smt_width and smt_width >= 4 and len(rows) >= 5:
+        level = "warning"
+
+    return {
+        "level": level,
+        "title": title,
+        "interpretation": interpretation,
+        "rows": sorted(rows, key=lambda row: (row["top_lcpu_percent"], row["samples"]), reverse=True)[:50],
+    }
 
 
 def summarize_events(events: list[dict[str, str]]) -> list[dict[str, str | float | int]]:
@@ -863,6 +1657,7 @@ def build_findings(
     processes: dict[int, OracleProcess],
     topology: dict[str, object],
     remote_rd_threshold: float,
+    local_hrd_threshold: float,
     rq_threshold: float,
 ) -> list[tuple[str, str, str]]:
     findings: list[tuple[str, str, str]] = []
@@ -883,18 +1678,24 @@ def build_findings(
 
     high_remote = []
     for label, values in stats.items():
-        s3rd = values.get("s3rd")
-        s3hrd = values.get("s3hrd")
-        if (s3rd is not None and float(s3rd) >= remote_rd_threshold) or (
-            s3hrd is not None and float(s3hrd) < 85.0
+        s4rd = as_float(values.get("s4rd"))
+        s5rd = as_float(values.get("s5rd"))
+        s3hrd = as_float(values.get("s3hrd"))
+        s5hrd = as_float(values.get("s5hrd"))
+        remote_redispatch = none_sum((s4rd, s5rd))
+        if (
+            (remote_redispatch is not None and remote_redispatch >= remote_rd_threshold)
+            or (s3hrd is not None and s3hrd < local_hrd_threshold)
+            or (s5hrd is not None and s5hrd >= max(0.0, 100.0 - local_hrd_threshold))
         ):
-            high_remote.append((label, values))
-    for label, values in high_remote:
+            high_remote.append((label, values, remote_redispatch))
+    for label, values, remote_redispatch in high_remote:
         findings.append(
             (
                 "warning",
-                f"Elevated remote dispatch/readiness on {label}",
-                f"{label}: S3rd={fmt(values.get('s3rd'))}%, S3hrd={fmt(values.get('s3hrd'))}%. "
+                f"Elevated remote redispatch or non-local memory on {label}",
+                f"{label}: S4rd+S5rd={fmt(remote_redispatch)}%, S3hrd={fmt(values.get('s3hrd'))}%, "
+                f"S5hrd={fmt(values.get('s5hrd'))}%. "
                 "Missing mpstat columns are treated as n/a and do not trigger this finding.",
             )
         )
@@ -1105,6 +1906,7 @@ def render_topology_note(topology: dict[str, object]) -> str:
         '<p class="note">'
         f"SMT width=<strong>{esc(topology.get('smt_width', 'unknown'))}</strong>; "
         f"source=<strong>{esc(topology.get('smt_width_source', 'unknown'))}</strong>; "
+        f"LCPU->core mapping=<strong>{esc(topology.get('smt_mapping_source', 'unknown'))}</strong>; "
         f"classes={esc(', '.join(topology.get('smt_classes', [])) or 'unknown')}; "
         f"smtctl mixed width={esc(mixed.strip())}."
         f"{warning_html}</p>"
@@ -1125,13 +1927,18 @@ def render_lssrad_range_table(stats: dict[str, dict[str, float | int | None]]) -
             f"<td>{fmt(values.get('s1rd'))}%</td>"
             f"<td>{fmt(values.get('s2rd'))}%</td>"
             f"<td>{fmt(values.get('s3rd'))}%</td>"
+            f"<td>{fmt(values.get('s4rd'))}%</td>"
+            f"<td>{fmt(values.get('s5rd'))}%</td>"
             f"<td>{fmt(values.get('s3hrd'))}%</td>"
+            f"<td>{fmt(values.get('s4hrd'))}%</td>"
+            f"<td>{fmt(values.get('s5hrd'))}%</td>"
             f"<td>{fmt(values.get('nsp'))}%</td>"
             "</tr>"
         )
     return (
         "<table><thead><tr><th>LSSRAD CPU range</th><th>LCPU</th><th>rq</th><th>bound</th>"
-        "<th>S0rd</th><th>S1rd</th><th>S2rd</th><th>S3rd</th><th>S3hrd</th><th>%nsp</th></tr></thead><tbody>"
+        "<th>S0rd</th><th>S1rd</th><th>S2rd</th><th>S3rd</th><th>S4rd</th><th>S5rd</th>"
+        "<th>S3hrd</th><th>S4hrd</th><th>S5hrd</th><th>%nsp</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1172,6 +1979,7 @@ def render_cpu_table(placements: dict[int, CpuPlacement], mpstat: dict[int, Mpst
             f"<td>{fmt(placement.physical_core_id, 0)}</td>"
             f"<td>{fmt(placement.smt_position, 0)}</td>"
             f"<td>{esc(placement.smt_class_label)}</td>"
+            f"<td>{esc(placement.smt_mapping_source)}</td>"
             f"<td>{fmt(mp.avg('rq') if mp else None)}</td>"
             f"<td>{fmt(mp.avg('cs') if mp else None)}</td>"
             f"<td>{fmt(mp.avg('ics') if mp else None)}</td>"
@@ -1179,13 +1987,18 @@ def render_cpu_table(placements: dict[int, CpuPlacement], mpstat: dict[int, Mpst
             f"<td>{fmt(mp.avg('S1rd') if mp else None)}%</td>"
             f"<td>{fmt(mp.avg('S2rd') if mp else None)}%</td>"
             f"<td>{fmt(mp.avg('S3rd') if mp else None)}%</td>"
+            f"<td>{fmt(mp.avg('S4rd') if mp else None)}%</td>"
+            f"<td>{fmt(mp.avg('S5rd') if mp else None)}%</td>"
             f"<td>{fmt(mp.avg('S3hrd') if mp else None)}%</td>"
+            f"<td>{fmt(mp.avg('S4hrd') if mp else None)}%</td>"
+            f"<td>{fmt(mp.avg('S5hrd') if mp else None)}%</td>"
             "</tr>"
         )
     return (
         "<table><thead><tr><th>LCPU</th><th>REF</th><th>SRAD</th><th>LSSRAD CPU range</th><th>Range</th>"
-        "<th>Physical core</th><th>SMT position</th><th>SMT class</th>"
-        "<th>rq</th><th>cs</th><th>ics</th><th>S0rd</th><th>S1rd</th><th>S2rd</th><th>S3rd</th><th>S3hrd</th></tr></thead><tbody>"
+        "<th>Physical core</th><th>SMT position</th><th>SMT class</th><th>SMT mapping source</th>"
+        "<th>rq</th><th>cs</th><th>ics</th><th>S0rd</th><th>S1rd</th><th>S2rd</th><th>S3rd</th>"
+        "<th>S4rd</th><th>S5rd</th><th>S3hrd</th><th>S4hrd</th><th>S5hrd</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1231,6 +2044,7 @@ def render_physical_core_table(rows_data: list[dict[str, object]], smt_width: in
         rows.append(
             "<tr>"
             f"<td>{esc(row['physical_core_id'])}</td>"
+            f"<td>{esc(row.get('smt_mapping_source', 'unknown'))}</td>"
             f"<td>{esc(row['ref'])}</td>"
             f"<td>{esc(row['srad'])}</td>"
             f"{dynamic}"
@@ -1242,7 +2056,7 @@ def render_physical_core_table(rows_data: list[dict[str, object]], smt_width: in
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>Physical core</th><th>REF</th><th>SRAD</th>"
+        "<table><thead><tr><th>Physical core</th><th>SMT mapping source</th><th>REF</th><th>SRAD</th>"
         + header
         + "<th>Active SMT threads</th><th>Trace samples</th><th>rq total</th><th>bound total</th><th>avg %nsp</th></tr></thead><tbody>"
         + "\n".join(rows)
@@ -1267,13 +2081,18 @@ def render_smt_position_table(rows_data: list[dict[str, object]]) -> str:
             f"<td>{fmt(row['nsp_avg'])}%</td>"
             f"<td>{fmt(row['s2rd'])}%</td>"
             f"<td>{fmt(row['s3rd'])}%</td>"
+            f"<td>{fmt(row['s4rd'])}%</td>"
+            f"<td>{fmt(row['s5rd'])}%</td>"
             f"<td>{fmt(row['s3hrd'])}%</td>"
+            f"<td>{fmt(row['s4hrd'])}%</td>"
+            f"<td>{fmt(row['s5hrd'])}%</td>"
             "</tr>"
         )
     return (
         "<table><thead><tr><th>SMT position</th><th>SMT class</th><th>LCPU list</th><th>Active LCPU count</th>"
         "<th>Trace samples total</th><th>Trace samples %</th><th>Average samples per LCPU</th>"
-        "<th>rq total</th><th>bound total</th><th>avg %nsp</th><th>S2rd</th><th>S3rd</th><th>S3hrd</th>"
+        "<th>rq total</th><th>bound total</th><th>avg %nsp</th><th>S2rd</th><th>S3rd</th><th>S4rd</th><th>S5rd</th>"
+        "<th>S3hrd</th><th>S4hrd</th><th>S5hrd</th>"
         "</tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
@@ -1424,6 +2243,103 @@ def render_vpm_diagnosis(diagnosis: dict[str, object]) -> str:
     )
 
 
+def render_diagnostic_box(diagnosis: dict[str, object]) -> str:
+    evidence = diagnosis.get("evidence", [])
+    evidence_html = ""
+    if evidence:
+        evidence_html = "<ul>" + "".join(f"<li>{esc(line)}</li>" for line in evidence) + "</ul>"
+    return (
+        f'<div class="finding {esc(diagnosis.get("level", "info"))}">'
+        f"<strong>{esc(diagnosis.get('title', ''))}</strong>"
+        f"<p>{esc(diagnosis.get('interpretation', ''))}</p>"
+        f"{evidence_html}"
+        "</div>"
+    )
+
+
+def render_memory_topology_table(summary: dict[str, object]) -> str:
+    rows = []
+    for row in summary.get("rows", []):
+        rows.append(
+            "<tr>"
+            f"<td>{esc(row.get('ref') if row.get('ref') is not None else '-')}</td>"
+            f"<td>{esc(row.get('srad'))}</td>"
+            f"<td>{fmt(row.get('memory_gb'))}</td>"
+            f"<td>{esc(row.get('lcpu_count'))}</td>"
+            f"<td>{fmt(row.get('physical_core_count'))}</td>"
+            f"<td>{fmt(row.get('memory_mb_per_lcpu'))}</td>"
+            f"<td>{fmt(row.get('memory_mb_per_physical_core'))}</td>"
+            f"<td>{esc(', '.join(str(cpu) for cpu in row.get('lcpus', [])))}</td>"
+            f"<td>{esc(', '.join(str(cpu_range) for cpu_range in row.get('ranges', [])))}</td>"
+            "</tr>"
+        )
+    return (
+        render_diagnostic_box(summary)
+        + "<table><thead><tr><th>REF</th><th>SRAD</th><th>Memory GB</th><th>LCPU</th><th>Physical cores</th>"
+        "<th>MB/LCPU</th><th>MB/core</th><th>LCPU list</th><th>CPU ranges</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def render_affinity_diagnosis(diagnosis: dict[str, object]) -> str:
+    rows = []
+    for row in diagnosis.get("range_rows", []):
+        rows.append(
+            "<tr>"
+            f"<td>{esc(row.get('lssrad_range_label'))}</td>"
+            f"<td>{fmt(row.get('affinity_score'))}</td>"
+            f"<td>{fmt(row.get('remote_redispatch'))}%</td>"
+            f"<td>{fmt(row.get('non_local_memory'))}%</td>"
+            f"<td>{fmt(row.get('s0rd'))}%</td>"
+            f"<td>{fmt(row.get('s1rd'))}%</td>"
+            f"<td>{fmt(row.get('s3rd'))}%</td>"
+            f"<td>{fmt(row.get('s4rd'))}%</td>"
+            f"<td>{fmt(row.get('s5rd'))}%</td>"
+            f"<td>{fmt(row.get('s3hrd'))}%</td>"
+            f"<td>{fmt(row.get('s4hrd'))}%</td>"
+            f"<td>{fmt(row.get('s5hrd'))}%</td>"
+            f"<td>{fmt(row.get('nsp'))}%</td>"
+            "</tr>"
+        )
+    return (
+        render_diagnostic_box(diagnosis)
+        + "<table><thead><tr><th>LSSRAD CPU range</th><th>Affinity score</th><th>S4rd+S5rd</th><th>Non-local hrd</th>"
+        "<th>S0rd</th><th>S1rd</th><th>S3rd</th><th>S4rd</th><th>S5rd</th>"
+        "<th>S3hrd</th><th>S4hrd</th><th>S5hrd</th><th>%nsp</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def render_thread_constraint_table(diagnosis: dict[str, object]) -> str:
+    rows = []
+    for row in diagnosis.get("rows", []):
+        rows.append(
+            "<tr>"
+            f"<td>{esc(row.get('pid'))}</td>"
+            f"<td>{esc(row.get('name') or '-')}</td>"
+            f"<td>{esc(row.get('sql_id') or '-')}</td>"
+            f"<td>{esc(row.get('samples'))}</td>"
+            f"<td>{esc(row.get('top_lcpu'))}</td>"
+            f"<td>{fmt(row.get('top_lcpu_percent'))}%</td>"
+            f"<td>{esc(row.get('top_physical_core') if row.get('top_physical_core') is not None else '-')}</td>"
+            f"<td>{fmt(row.get('top_physical_core_percent'))}%</td>"
+            f"<td>{fmt(row.get('oratop_cpu'))}%</td>"
+            f"<td>{esc(row.get('wait_class') or '-')}</td>"
+            f"<td>{esc(row.get('event') or '-')}</td>"
+            "</tr>"
+        )
+    return (
+        render_diagnostic_box(diagnosis)
+        + "<table><thead><tr><th>PID/SPID</th><th>Name</th><th>SQL_ID</th><th>Trace samples</th>"
+        "<th>Top LCPU</th><th>Top LCPU %</th><th>Top core</th><th>Top core %</th>"
+        "<th>oratop %CPU</th><th>Wait class</th><th>Event</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
 def render_report(
     placements: dict[int, CpuPlacement],
     mpstat: dict[int, MpstatCpu],
@@ -1433,12 +2349,14 @@ def render_report(
     processes: dict[int, OracleProcess],
     events: list[dict[str, str]],
     topology: dict[str, object],
+    optional_context: dict[str, object],
     remote_rd_threshold: float,
+    local_hrd_threshold: float,
     rq_threshold: float,
     out_path: Path,
 ) -> None:
     stats = lssrad_range_stats(placements, mpstat)
-    findings = build_findings(stats, events, processes, topology, remote_rd_threshold, rq_threshold)
+    findings = build_findings(stats, events, processes, topology, remote_rd_threshold, local_hrd_threshold, rq_threshold)
     vpm_diagnosis = diagnose_vpm_throughput_mode(stats, events, processes, trace_by_pid, topology, mp_config, rq_threshold)
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     summarized_events = summarize_events(events)
@@ -1448,6 +2366,31 @@ def render_report(
     smt_stats = smt_position_stats(placements, mpstat, trace_by_pid, smt_width)
     smt_summary = global_smt_summary(trace_by_pid, smt_width)
     range_mapping = lssrad_range_mapping(placements)
+    memory_topology = memory_topology_summary(placements, smt_width)
+    affinity = diagnose_affinity(stats, smt_stats, remote_rd_threshold, local_hrd_threshold)
+    memory_pressure = diagnose_memory_pressure(
+        optional_context.get("vmstat_v", {}),
+        optional_context.get("vmstat_s", {}),
+        optional_context.get("vmstat_interval", {}),
+        optional_context.get("vmo", {}),
+        placements,
+    )
+    oracle_memory_pages = diagnose_oracle_memory_pages(
+        optional_context.get("oratop_summary", {}),
+        optional_context.get("oracle_params", {}),
+        optional_context.get("vmo", {}),
+        optional_context.get("asoo", {}),
+        str(optional_context.get("aso_status_text", "")),
+        optional_context.get("svmon", {}),
+    )
+    lpar_sizing = diagnose_lpar_sizing(mp_config, optional_context.get("lparstat", {}), smt_width, placements)
+    extended_vpm = diagnose_extended_vpm(
+        vpm_diagnosis,
+        optional_context.get("schedo", {}),
+        str(optional_context.get("mpstat_v_text", "")),
+        lpar_sizing,
+    )
+    thread_constraints = diagnose_thread_constraints(trace_by_pid, processes, placements, smt_width)
     top_processes = sorted(
         processes.values(),
         key=lambda proc: ((proc.oratop_cpu or 0), trace_by_pid.get(proc.pid, TraceThread(proc.pid)).samples),
@@ -1497,6 +2440,7 @@ code {{ background: #eef2f6; padding: 1px 4px; border-radius: 4px; }}
 <div class="card"><div class="label">Mode</div><div class="value">{esc(mp_config.get("mode", "-"))}</div></div>
 <div class="card"><div class="label">SMT Width</div><div class="value">{esc(smt_width if smt_width is not None else "unknown")}</div></div>
 <div class="card"><div class="label">SMT Source</div><div class="value">{esc(topology.get("smt_width_source", "unknown"))}</div></div>
+<div class="card"><div class="label">SMT Mapping</div><div class="value">{esc(topology.get("smt_mapping_source", "unknown"))}</div></div>
 <div class="card"><div class="label">Oracle PIDs in trace</div><div class="value">{len(trace_by_pid)}</div></div>
 </section>
 
@@ -1509,6 +2453,27 @@ code {{ background: #eef2f6; padding: 1px 4px; border-radius: 4px; }}
 <h2>Oracle on SMT Threads</h2>
 {render_global_smt_summary(smt_summary)}
 
+<h2>Memory Topology</h2>
+{render_memory_topology_table(memory_topology)}
+
+<h2>CPU and Memory Affinity</h2>
+{render_affinity_diagnosis(affinity)}
+
+<h2>AIX Memory Pressure</h2>
+{render_diagnostic_box(memory_pressure)}
+
+<h2>Oracle SGA Page Size, Kernel Pinning, and DSO</h2>
+{render_diagnostic_box(oracle_memory_pages)}
+
+<h2>LPAR Sizing</h2>
+{render_diagnostic_box(lpar_sizing)}
+
+<h2>Extended VP Folding</h2>
+{render_diagnostic_box(extended_vpm)}
+
+<h2>Process Thread Constraints</h2>
+{render_thread_constraint_table(thread_constraints)}
+
 <h3>Per Oracle Process</h3>
 {render_process_table(top_processes, trace_by_pid, smt_width)}
 
@@ -1519,7 +2484,7 @@ code {{ background: #eef2f6; padding: 1px 4px; border-radius: 4px; }}
 {render_smt_position_table(smt_stats)}
 
 <h2>Physical Cores</h2>
-<p class="note">Physical core ID is calculated as <code>lcpu // smt_width</code>; SMT class is <code>lcpu % smt_width</code>.</p>
+<p class="note">Physical core ID and SMT class use smtctl bind-map data when available; otherwise the report falls back to an LCPU arithmetic heuristic.</p>
 {render_physical_core_table(core_stats, smt_width)}
 
 <h2>LSSRAD CPU Range Summary</h2>
@@ -1595,11 +2560,13 @@ def build_json_report(
     processes: dict[int, OracleProcess],
     events: list[dict[str, str]],
     topology: dict[str, object],
+    optional_context: dict[str, object],
     remote_rd_threshold: float,
+    local_hrd_threshold: float,
     rq_threshold: float,
 ) -> dict[str, object]:
     stats = lssrad_range_stats(placements, mpstat)
-    findings = build_findings(stats, events, processes, topology, remote_rd_threshold, rq_threshold)
+    findings = build_findings(stats, events, processes, topology, remote_rd_threshold, local_hrd_threshold, rq_threshold)
     summarized_events = summarize_events(events)
     top_sql = summarize_sql_ids(processes, trace_by_pid)
     vpm_diagnosis = diagnose_vpm_throughput_mode(stats, events, processes, trace_by_pid, topology, mp_config, rq_threshold)
@@ -1607,6 +2574,31 @@ def build_json_report(
     core_stats = physical_core_stats(placements, mpstat, trace_by_pid, smt_width)
     smt_stats = smt_position_stats(placements, mpstat, trace_by_pid, smt_width)
     smt_summary = global_smt_summary(trace_by_pid, smt_width)
+    memory_topology = memory_topology_summary(placements, smt_width)
+    affinity = diagnose_affinity(stats, smt_stats, remote_rd_threshold, local_hrd_threshold)
+    memory_pressure = diagnose_memory_pressure(
+        optional_context.get("vmstat_v", {}),
+        optional_context.get("vmstat_s", {}),
+        optional_context.get("vmstat_interval", {}),
+        optional_context.get("vmo", {}),
+        placements,
+    )
+    oracle_memory_pages = diagnose_oracle_memory_pages(
+        optional_context.get("oratop_summary", {}),
+        optional_context.get("oracle_params", {}),
+        optional_context.get("vmo", {}),
+        optional_context.get("asoo", {}),
+        str(optional_context.get("aso_status_text", "")),
+        optional_context.get("svmon", {}),
+    )
+    lpar_sizing = diagnose_lpar_sizing(mp_config, optional_context.get("lparstat", {}), smt_width, placements)
+    extended_vpm = diagnose_extended_vpm(
+        vpm_diagnosis,
+        optional_context.get("schedo", {}),
+        str(optional_context.get("mpstat_v_text", "")),
+        lpar_sizing,
+    )
+    thread_constraints = diagnose_thread_constraints(trace_by_pid, processes, placements, smt_width)
 
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -1620,9 +2612,17 @@ def build_json_report(
             "oracle_pids_in_trace": len(trace_by_pid),
             "smt_width": smt_width,
             "smt_width_source": topology.get("smt_width_source"),
+            "smt_mapping_source": topology.get("smt_mapping_source"),
         },
         "findings": [{"level": level, "title": title, "details": details} for level, title, details in findings],
         "vpm_throughput_mode": vpm_diagnosis,
+        "memory_topology": memory_topology,
+        "cpu_memory_affinity": affinity,
+        "aix_memory_pressure": memory_pressure,
+        "oracle_memory_pages": oracle_memory_pages,
+        "lpar_sizing": lpar_sizing,
+        "extended_vp_folding": extended_vpm,
+        "thread_constraints": thread_constraints,
         "oracle_smt_summary": smt_summary,
         "lssrad_cpu_range_mapping": lssrad_range_mapping(placements),
         "lssrad_cpu_range_stats": stats,
@@ -1636,9 +2636,11 @@ def build_json_report(
                 "lssrad_range_index": placement.lssrad_range_index,
                 "lssrad_range_label": placement.lssrad_range_label,
                 "lssrad_cpu_range": placement.lssrad_cpu_range,
+                "srad_memory_mb": placement.srad_memory_mb,
                 "smt_width": placement.smt_width,
                 "smt_position": placement.smt_position,
                 "smt_class_label": placement.smt_class_label,
+                "smt_mapping_source": placement.smt_mapping_source,
                 "physical_core_id": placement.physical_core_id,
                 "mpstat": {
                     "rq": mpstat[cpu].avg("rq") if cpu in mpstat else None,
@@ -1648,7 +2650,11 @@ def build_json_report(
                     "S1rd": mpstat[cpu].avg("S1rd") if cpu in mpstat else None,
                     "S2rd": mpstat[cpu].avg("S2rd") if cpu in mpstat else None,
                     "S3rd": mpstat[cpu].avg("S3rd") if cpu in mpstat else None,
+                    "S4rd": mpstat[cpu].avg("S4rd") if cpu in mpstat else None,
+                    "S5rd": mpstat[cpu].avg("S5rd") if cpu in mpstat else None,
                     "S3hrd": mpstat[cpu].avg("S3hrd") if cpu in mpstat else None,
+                    "S4hrd": mpstat[cpu].avg("S4hrd") if cpu in mpstat else None,
+                    "S5hrd": mpstat[cpu].avg("S5hrd") if cpu in mpstat else None,
                 },
             }
             for cpu, placement in sorted(placements.items())
@@ -1715,7 +2721,9 @@ def write_json_report(
     processes: dict[int, OracleProcess],
     events: list[dict[str, str]],
     topology: dict[str, object],
+    optional_context: dict[str, object],
     remote_rd_threshold: float,
+    local_hrd_threshold: float,
     rq_threshold: float,
     out_path: Path,
 ) -> None:
@@ -1728,7 +2736,9 @@ def write_json_report(
         processes,
         events,
         topology,
+        optional_context,
         remote_rd_threshold,
+        local_hrd_threshold,
         rq_threshold,
     )
     out_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
@@ -1741,13 +2751,32 @@ def assert_equal(actual: object, expected: object, message: str) -> None:
 
 def run_selftests() -> None:
     placements = {lcpu: CpuPlacement(lcpu, None, 0, 1, "range-1", "0-7") for lcpu in range(8)}
-    apply_smt_topology(placements, 4)
-    assert_equal((placements[0].smt_class_label, placements[0].physical_core_id), ("primary", 0), "SMT-4 LCPU 0")
-    assert_equal((placements[1].smt_class_label, placements[1].physical_core_id), ("secondary", 0), "SMT-4 LCPU 1")
-    assert_equal((placements[4].smt_class_label, placements[4].physical_core_id), ("primary", 1), "SMT-4 LCPU 4")
-    assert_equal((placements[7].smt_class_label, placements[7].physical_core_id), ("quaternary", 1), "SMT-4 LCPU 7")
-    apply_smt_topology(placements, 2)
-    assert_equal((placements[5].smt_class_label, placements[5].physical_core_id), ("secondary", 2), "SMT-2 LCPU 5")
+    smt_bind_sample = """proc0 has 4 SMT threads.
+Bind processor 0 is bound with proc0
+Bind processor 1 is bound with proc0
+Bind processor 2 is bound with proc0
+Bind processor 3 is bound with proc0
+proc8 has 4 SMT threads.
+Bind processor 4 is bound with proc8
+Bind processor 5 is bound with proc8
+Bind processor 6 is bound with proc8
+Bind processor 7 is bound with proc8
+"""
+    smt_bind = parse_smtctl(smt_bind_sample)
+    assert_equal(smt_bind["proc_threads"]["proc0"], [0, 1, 2, 3], "smtctl proc0 threads")
+    assert_equal(smt_bind["proc_threads"]["proc8"], [4, 5, 6, 7], "smtctl proc8 threads")
+    assert_equal([smt_bind["lcpu_to_core"][cpu] for cpu in range(8)], [0, 0, 0, 0, 1, 1, 1, 1], "smtctl core IDs")
+    assert_equal([smt_bind["lcpu_to_position"][cpu] for cpu in range(8)], [0, 1, 2, 3, 0, 1, 2, 3], "smtctl positions")
+    apply_smt_topology(placements, 4, smt_bind)
+    assert_equal((placements[4].physical_core_id, placements[4].smt_position), (1, 0), "bind-map proc8 starts core 1")
+    assert_equal((placements[7].smt_class_label, placements[7].smt_mapping_source), ("quaternary", "smtctl-bindmap"), "bind-map source")
+
+    heuristic_info = parse_smtctl("proc0 has 4 SMT threads.\nproc8 has 4 SMT threads.\n")
+    heuristic_topology = resolve_smt_topology(None, heuristic_info, placements)
+    apply_smt_topology(placements, heuristic_topology.get("smt_width"), heuristic_info)
+    assert_equal(placements[7].smt_mapping_source, "heuristic", "heuristic fallback source")
+    assert_equal(heuristic_topology["smt_mapping_source"], "heuristic", "heuristic topology source")
+    assert any("LCPU->core mapping is heuristic" in warning for warning in heuristic_topology["warnings"]), "heuristic warning"
 
     smt4 = parse_smtctl(
         """
@@ -1768,6 +2797,10 @@ SMT threads: 8
     )
     assert_equal(smt8["smt_width"], 8, "smtctl SMT-8")
 
+    boot_disabled = parse_smtctl("SMT is currently enabled.\nSMT boot mode is set to disabled.\nproc0 has 4 SMT threads.\n")
+    assert_equal(boot_disabled["smt_enabled"], True, "smtctl boot mode does not override runtime enabled")
+    assert_equal(boot_disabled["smt_width"], 4, "smtctl boot mode disabled keeps runtime width")
+
     disabled = parse_smtctl("This system is SMT capable.\nSMT is currently disabled.\nproc0 has 4 SMT threads.\n")
     assert_equal(disabled["smt_width"], 1, "smtctl disabled")
 
@@ -1775,22 +2808,59 @@ SMT threads: 8
     assert_equal(mixed["smt_width"], 8, "smtctl mixed mode")
     assert_equal(mixed["smt_width_mixed"], True, "smtctl mixed flag")
 
-    mp_text = """System configuration: lcpu=2 ent=2.00 mode=uncapped
-cpu min maj mpcs ics cs rq migrations S0rd S1rd
-0 0 0 0 0 0 0 0 1.0 2.0
-1 0 0 0 0 0 0 0 1.0 2.0
+    mp_text = """System configuration: lcpu=3 ent=2.00 mode=uncapped
+cpu min maj mpcs ics cs rq migrations S0rd S1rd S2rd S3rd S4rd S5rd S3hrd S4hrd S5hrd
+0 0 0 0 0 0 0 0 1.0 2.0 0.0 95.0 0.0 0.0 99.0 1.0 0.0
+1 0 0 0 0 0 0 0 1.0 2.0 0.0 0.0 4.0 2.0 99.0 1.0 0.0
+2 0 0 0 0 0 0 0 1.0 2.0 0.0 0.0 0.0 0.0 80.0 20.0 0.0
 """
     mpstat, config, columns = parse_mpstat(mp_text)
-    stats = lssrad_range_stats(placements, mpstat)
-    findings = build_findings(stats, [], {}, {"warnings": []}, remote_rd_threshold=5.0, rq_threshold=8.0)
-    assert not any("Elevated remote" in title for _, title, _ in findings), "missing S3hrd must not trigger remote finding"
-    assert "S3hrd" not in columns, "S3hrd should be absent from dynamic columns"
+    affinity_placements = {
+        0: CpuPlacement(0, None, 0, 1, "range-1", "0"),
+        1: CpuPlacement(1, None, 0, 2, "range-2", "1"),
+        2: CpuPlacement(2, None, 0, 3, "range-3", "2"),
+    }
+    stats = lssrad_range_stats(affinity_placements, mpstat)
+    findings = build_findings(stats, [], {}, {"warnings": []}, remote_rd_threshold=5.0, local_hrd_threshold=85.0, rq_threshold=8.0)
+    assert not any("range-1" in details for _, _, details in findings), "high S3rd alone must not trigger"
+    assert any("range-2" in details for _, _, details in findings), "S4rd+S5rd must trigger"
+    assert any("range-3" in details for _, _, details in findings), "low S3hrd must trigger"
+    assert "S4rd" in columns and "S5hrd" in columns, "remote and hrd columns should be parsed"
 
     lssrad = parse_lssrad("REF1   SRAD        MEM      CPU\n0\n          0   1.00      0-3 32-35\n")
+    assert_equal(lssrad[0].srad_memory_mb, 1.0, "lssrad memory is retained")
+    combined_lssrad = parse_lssrad(
+        """REF1   SRAD        MEM      CPU
+0  0  19456.00  0-11 16-19 28-31
+1  13145.38  12-15 24-27
+"""
+    )
+    assert_equal(combined_lssrad[0].ref, 0, "combined lssrad ref")
+    assert_equal(combined_lssrad[0].srad, 0, "combined lssrad srad")
+    assert_equal(combined_lssrad[0].srad_memory_mb, 19456.00, "combined lssrad memory")
+    assert_equal(combined_lssrad[0].lssrad_cpu_range, "0-11", "combined lssrad range")
+    assert_equal(combined_lssrad[12].ref, 0, "following lssrad line keeps ref")
+    assert_equal(combined_lssrad[12].srad, 1, "following lssrad line srad")
+    assert_equal(combined_lssrad[12].srad_memory_mb, 13145.38, "following lssrad line memory")
     smtctl_info = parse_smtctl("proc0 has 8 SMT threads.\n")
     assert_equal(resolve_smt_topology(4, smtctl_info, lssrad)["smt_width_source"], "cli", "CLI source wins")
     assert_equal(resolve_smt_topology(None, smtctl_info, lssrad)["smt_width_source"], "smtctl", "smtctl source wins")
     assert_equal(resolve_smt_topology(None, None, lssrad)["smt_width_source"], "inferred", "inferred source used")
+
+    large_pages = diagnose_oracle_memory_pages({"sga_mb": 102400.0}, {}, {}, {}, "", {})
+    assert_equal(large_pages["base_16mb_large_pages"], 6400, "base 16MB large-page count")
+    assert_equal(large_pages["lock_sga_16mb_large_pages"], 6403, "LOCK_SGA 16MB large-page count")
+
+    maxfree_placements = {lcpu: CpuPlacement(lcpu, None, 0, 1, "range-1", "0-19") for lcpu in range(20)}
+    memory_pressure = diagnose_memory_pressure(
+        {"memory_pools": 2},
+        {},
+        {},
+        {"maxpgahead": "8", "j2_maxpagereadahead": "128"},
+        maxfree_placements,
+    )
+    assert_equal(memory_pressure["expected_minfree"], 1200.0, "IBM maxfree example minfree")
+    assert_equal(memory_pressure["expected_maxfree"], 2480.0, "IBM maxfree example maxfree")
 
     oratop_text = """ID   SID SPID USERNAME PROGRAM SERVER SERVICE SQLID ELAP %CPU PGA STATUS STATE EVENT
  1  3803 53084826 SYSADM   JDBC Thin DED szpital SEL gn3gtqxvucbj8 1.0s  1.2  0.7  37M ACT RUN            On CPU                3u
@@ -1814,6 +2884,30 @@ cpu min maj mpcs ics cs rq migrations S0rd S1rd
     assert_equal(repeated_proc.event, "On CPU 3u", "oratop keeps active CPU event over later idle sample")
     assert_equal(repeated_proc.oratop_cpu, 1.2, "oratop keeps max CPU across repeated samples")
 
+    tunables = parse_tunables("minfree = 1200\nmaxfree 2024\nvpm_xvcpus = 2\n")
+    assert_equal(tunables["minfree"], "1200", "parse vmo style tunable")
+    assert_equal(tunables["maxfree"], "2024", "parse column tunable")
+    assert_equal(tunables["vpm_xvcpus"], "2", "parse schedo style tunable")
+
+    vmstat_s = parse_vmstat_s("123 free frame waits\n9 paging space page outs\n")
+    assert_equal(vmstat_s["free_frame_waits"], 123, "parse vmstat -s free frame waits")
+    assert_equal(vmstat_s["paging_space_page_outs"], 9, "parse vmstat -s paging outs")
+
+    vmstat_interval = parse_vmstat_interval(
+        """
+kthr     memory             page              faults        cpu
+----- ----------- ------------------------ ------------ -----------
+ r  b   avm   fre  re  pi  po  fr   sr  cy  in   sy  cs us sy id wa
+ 1  0  1000   500   0   2   0   0    0   0 100  200 300 10  5 85  0
+ 2  1  1000   300   0   4   1   0    0   0 100  200 300 20  5 75  0
+"""
+    )
+    assert_equal(vmstat_interval["pi_avg"], 3.0, "parse vmstat interval pi avg")
+    assert_equal(vmstat_interval["po_max"], 1.0, "parse vmstat interval po max")
+
+    lparstat = parse_lparstat("Online Virtual CPUs : 10\nEntitled Capacity : 5.00\n")
+    assert_equal(lparstat["online_virtual_cpus"], "10", "parse lparstat online VPs")
+
 
 def parse_args() -> argparse.Namespace:
     epilog = """Commands to collect input data on AIX:
@@ -1825,6 +2919,28 @@ def parse_args() -> argparse.Namespace:
   trcrpt /tmp/trace.out > /tmp/trace.trcrpt
   lssrad -av > /tmp/lssrad_av.out
   mpstat -d 1 60 > /tmp/mpstat_d.out
+  mpstat -v 1 60 > /tmp/mpstat_v.out
+  vmstat -v > /tmp/vmstat_v.out
+  vmstat -s > /tmp/vmstat_s.out
+  vmstat 1 60 > /tmp/vmstat.out
+  vmo -F -a > /tmp/vmo_a.out
+  schedo -a > /tmp/schedo_a.out
+  lparstat -i > /tmp/lparstat_i.out
+  asoo -a > /tmp/asoo_a.out
+  lssrc -s aso > /tmp/aso_status.out
+  svmon -P <pmon_pid> -O mpss=on > /tmp/svmon_pmon.out
+  sqlplus -s / as sysdba <<'SQL' > /tmp/oracle_params.out
+  set pages 200 lines 220 trimspool on
+  show parameter lock_sga
+  show parameter sga_target
+  show parameter sga_max_size
+  show parameter memory_target
+  show parameter memory_max_target
+  show parameter pga_aggregate_target
+  show parameter pga_aggregate_limit
+  show parameter cpu_count
+  show parameter parallel_threads_per_cpu
+  SQL
 
 The --trace argument accepts either the raw /tmp/trace.out file when the tool is run on AIX
 with trcrpt available, or the pre-decoded /tmp/trace.trcrpt text file.
@@ -1837,6 +2953,17 @@ Example:
     --lssrad /tmp/lssrad_av.out \\
     --mpstat /tmp/mpstat_d.out \\
     --smtctl /tmp/smtctl.out \\
+    --mpstat-v /tmp/mpstat_v.out \\
+    --vmstat-v /tmp/vmstat_v.out \\
+    --vmstat-s /tmp/vmstat_s.out \\
+    --vmstat /tmp/vmstat.out \\
+    --vmo /tmp/vmo_a.out \\
+    --schedo /tmp/schedo_a.out \\
+    --lparstat /tmp/lparstat_i.out \\
+    --asoo /tmp/asoo_a.out \\
+    --aso-status /tmp/aso_status.out \\
+    --svmon-pmon /tmp/svmon_pmon.out \\
+    --oracle-params /tmp/oracle_params.out \\
     --output /tmp/oraix_report.html
 """
     parser = argparse.ArgumentParser(
@@ -1849,8 +2976,20 @@ Example:
     parser.add_argument("--lssrad", help="File generated by: lssrad -av")
     parser.add_argument("--mpstat", help="File generated by: mpstat -d 1 60")
     parser.add_argument("--smtctl", help="Optional file generated by: smtctl")
+    parser.add_argument("--mpstat-v", help="Optional file generated by: mpstat -v 1 60")
+    parser.add_argument("--vmstat-v", help="Optional file generated by: vmstat -v")
+    parser.add_argument("--vmstat-s", help="Optional file generated by: vmstat -s")
+    parser.add_argument("--vmstat", help="Optional file generated by: vmstat 1 60")
+    parser.add_argument("--vmo", help="Optional file generated by: vmo -F -a")
+    parser.add_argument("--schedo", help="Optional file generated by: schedo -a")
+    parser.add_argument("--lparstat", help="Optional file generated by: lparstat -i")
+    parser.add_argument("--asoo", help="Optional file generated by: asoo -a")
+    parser.add_argument("--aso-status", help="Optional file generated by: lssrc -s aso")
+    parser.add_argument("--svmon-pmon", help="Optional file generated by: svmon -P <pmon_pid> -O mpss=on")
+    parser.add_argument("--oracle-params", help="Optional Oracle parameter dump, for example: show parameter output")
     parser.add_argument("--smt-width", type=int, choices=SMT_WIDTH_CHOICES, help="Authoritative SMT width override: 1, 2, 4, or 8")
-    parser.add_argument("--remote-rd-threshold", type=float, default=5.0, help="Heuristic threshold for S3rd remote dispatch percent finding")
+    parser.add_argument("--remote-rd-threshold", type=float, default=5.0, help="Heuristic threshold for S4rd+S5rd remote redispatch percent finding")
+    parser.add_argument("--local-hrd-threshold", type=float, default=85.0, help="Heuristic threshold for S3hrd local home-SRAD dispatch percent finding")
     parser.add_argument("--rq-threshold", type=float, default=8.0, help="Heuristic threshold for total mpstat rq/bound CPU pressure finding")
     parser.add_argument("--format", choices=("html", "json", "auto"), default="auto", help="Output format. With auto, .json selects JSON; otherwise HTML.")
     parser.add_argument("--output", "-o", default="oraix_report.html", help="Output report path")
@@ -1862,6 +3001,39 @@ def validate_required_args(args: argparse.Namespace) -> None:
     missing = [name for name in ("oratop", "trace", "lssrad", "mpstat") if not getattr(args, name)]
     if missing:
         raise SystemExit("Missing required arguments: " + ", ".join(f"--{name}" for name in missing))
+
+
+def read_optional_text(path: str | None) -> str:
+    return read_text(path) if path else ""
+
+
+def build_optional_context(args: argparse.Namespace, oratop_text: str) -> dict[str, object]:
+    vmstat_v_text = read_optional_text(args.vmstat_v)
+    vmstat_s_text = read_optional_text(args.vmstat_s)
+    vmstat_text = read_optional_text(args.vmstat)
+    vmo_text = read_optional_text(args.vmo)
+    schedo_text = read_optional_text(args.schedo)
+    lparstat_text = read_optional_text(args.lparstat)
+    asoo_text = read_optional_text(args.asoo)
+    aso_status_text = read_optional_text(args.aso_status)
+    svmon_text = read_optional_text(args.svmon_pmon)
+    oracle_params_text = read_optional_text(args.oracle_params)
+    mpstat_v_text = read_optional_text(args.mpstat_v)
+
+    return {
+        "vmstat_v": parse_vmstat_v(vmstat_v_text),
+        "vmstat_s": parse_vmstat_s(vmstat_s_text),
+        "vmstat_interval": parse_vmstat_interval(vmstat_text),
+        "vmo": parse_tunables(vmo_text),
+        "schedo": parse_tunables(schedo_text),
+        "lparstat": parse_lparstat(lparstat_text),
+        "asoo": parse_tunables(asoo_text),
+        "aso_status_text": aso_status_text,
+        "svmon": parse_svmon_summary(svmon_text),
+        "oracle_params": parse_oracle_params(oracle_params_text),
+        "oratop_summary": parse_oratop_summary(oratop_text),
+        "mpstat_v_text": mpstat_v_text,
+    }
 
 
 def main() -> None:
@@ -1876,13 +3048,15 @@ def main() -> None:
     placements = parse_lssrad(read_text(args.lssrad))
     smtctl_info = parse_smtctl(read_text(args.smtctl)) if args.smtctl else None
     topology = resolve_smt_topology(args.smt_width, smtctl_info, placements)
-    apply_smt_topology(placements, topology.get("smt_width"))
+    apply_smt_topology(placements, topology.get("smt_width"), smtctl_info)
 
     mpstat, mp_config, mp_columns = parse_mpstat(read_text(args.mpstat))
     trace_report = load_trace_report(args.trace)
     trace_threads = parse_trace_report(trace_report, placements)
     trace_by_pid = merge_trace_by_pid(trace_threads)
-    oratop_processes, events = parse_oratop(read_text(args.oratop))
+    oratop_text = read_text(args.oratop)
+    optional_context = build_optional_context(args, oratop_text)
+    oratop_processes, events = parse_oratop(oratop_text)
     processes = merge_processes(oratop_processes)
     for pid, trace in trace_by_pid.items():
         proc = processes.setdefault(pid, OracleProcess(pid=pid))
@@ -1903,7 +3077,9 @@ def main() -> None:
             processes,
             events,
             topology,
+            optional_context,
             args.remote_rd_threshold,
+            args.local_hrd_threshold,
             args.rq_threshold,
             output,
         )
@@ -1917,7 +3093,9 @@ def main() -> None:
             processes,
             events,
             topology,
+            optional_context,
             args.remote_rd_threshold,
+            args.local_hrd_threshold,
             args.rq_threshold,
             output,
         )
