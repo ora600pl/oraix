@@ -77,6 +77,7 @@ class TraceThread:
     samples: int = 0
     cpus: Counter[int] = field(default_factory=Counter)
     lssrad_groups: Counter[str] = field(default_factory=Counter)
+    smt_positions: Counter[int] = field(default_factory=Counter)
 
 
 def read_text(path: str | Path) -> str:
@@ -267,6 +268,7 @@ def parse_trace_report(text: str, placements: dict[int, CpuPlacement]) -> dict[t
         placement = placements.get(cpu)
         if placement:
             row.lssrad_groups[placement.lssrad_group_label] += 1
+            row.smt_positions[placement.smt_position] += 1
     return threads
 
 
@@ -278,6 +280,7 @@ def merge_trace_by_pid(trace_threads: dict[tuple[int, int | None], TraceThread])
         target.samples += row.samples
         target.cpus.update(row.cpus)
         target.lssrad_groups.update(row.lssrad_groups)
+        target.smt_positions.update(row.smt_positions)
     return by_pid
 
 
@@ -429,6 +432,7 @@ def summarize_sql_ids(
                 "pids": set(),
                 "cpus": Counter(),
                 "lssrad_groups": Counter(),
+                "smt_positions": Counter(),
                 "waits": Counter(),
                 "users": Counter(),
             },
@@ -443,6 +447,7 @@ def summarize_sql_ids(
         if trace:
             row["cpus"].update(trace.cpus)
             row["lssrad_groups"].update(trace.lssrad_groups)
+            row["smt_positions"].update(trace.smt_positions)
 
     return sorted(grouped.values(), key=lambda row: float(row["cpu"]), reverse=True)
 
@@ -496,6 +501,35 @@ def lssrad_group_stats(
     for label, cpus in grouped.items():
         stats[label] = summarize_mpstat_rows(cpus, mpstat)
     return stats
+
+
+def lssrad_group_mapping(placements: dict[int, CpuPlacement]) -> list[dict[str, object]]:
+    grouped: dict[tuple[int, str], dict[str, object]] = {}
+    for placement in placements.values():
+        key = (placement.lssrad_group_index, placement.lssrad_group_label)
+        row = grouped.setdefault(
+            key,
+            {
+                "lssrad_group_index": placement.lssrad_group_index,
+                "lssrad_group_label": placement.lssrad_group_label,
+                "ranges": set(),
+                "smt_positions": set(),
+            },
+        )
+        row["ranges"].add(f"REF {placement.ref if placement.ref is not None else '-'} / SRAD {placement.srad}: {placement.group}")
+        row["smt_positions"].add(placement.smt_position)
+
+    rows = []
+    for _, row in sorted(grouped.items()):
+        rows.append(
+            {
+                "lssrad_group_index": row["lssrad_group_index"],
+                "lssrad_group_label": row["lssrad_group_label"],
+                "ranges": sorted(row["ranges"]),
+                "smt_positions": sorted(row["smt_positions"]),
+            }
+        )
+    return rows
 
 
 def smt_position_stats(
@@ -863,6 +897,7 @@ def render_report(
     core_stats = physical_core_stats(placements, mpstat, trace_by_pid)
     smt_stats = smt_position_stats(placements, mpstat, trace_by_pid)
     topology = topology_summary(placements)
+    group_mapping = lssrad_group_mapping(placements)
 
     top_processes = sorted(
         processes.values(),
@@ -923,6 +958,7 @@ code {{ background: #eef2f6; padding: 1px 4px; border-radius: 4px; }}
 <h2>LSSRAD Group Summary</h2>
 <p class="note">LSSRAD group labels are derived from CPU range order in <code>lssrad -av</code>. They do not represent SMT primary/secondary/tertiary thread classes. Use the SMT position summary for SMT behavior.</p>
 {render_lssrad_group_table(stats)}
+{render_lssrad_group_mapping_table(group_mapping)}
 
 <h2>LCPU Map</h2>
 {render_cpu_table(placements, mpstat)}
@@ -1056,6 +1092,27 @@ def render_lssrad_group_table(stats: dict[str, dict[str, float]]) -> str:
     )
 
 
+def render_lssrad_group_mapping_table(rows_data: list[dict[str, object]]) -> str:
+    rows = []
+    for row in rows_data:
+        rows.append(
+            "<tr>"
+            f"<td>{esc(row['lssrad_group_label'])}</td>"
+            f"<td>{esc(row['lssrad_group_index'])}</td>"
+            f"<td>{esc('; '.join(row['ranges']))}</td>"
+            f"<td>{esc(', '.join(str(pos) for pos in row['smt_positions']))}</td>"
+            "</tr>"
+        )
+    return (
+        "<h3>LSSRAD Group Mapping</h3>"
+        "<p class=\"note\">This mapping shows what each neutral group label means on this host. "
+        "For example, group-1 is the first CPU range listed inside each SRAD, not an SMT thread class.</p>"
+        "<table><thead><tr><th>LSSRAD group</th><th>Range order</th><th>CPU ranges by REF/SRAD</th><th>SMT positions inside each range</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
 def render_cpu_table(
     placements: dict[int, CpuPlacement], mpstat: dict[int, MpstatCpu]
 ) -> str:
@@ -1164,6 +1221,7 @@ def render_process_table(processes: list[OracleProcess], trace_by_pid: dict[int,
         trace_samples = trace.samples if trace else 0
         cpus = top_counter(trace.cpus if trace else Counter())
         lssrad_groups = top_counter(trace.lssrad_groups if trace else Counter())
+        smt_positions = top_counter(trace.smt_positions if trace else Counter())
         rows.append(
             "<tr>"
             f"<td>{proc.pid}</td>"
@@ -1175,6 +1233,7 @@ def render_process_table(processes: list[OracleProcess], trace_by_pid: dict[int,
             f"<td>{trace_samples}</td>"
             f"<td>{esc(cpus)}</td>"
             f"<td>{esc(lssrad_groups)}</td>"
+            f"<td>{esc(smt_positions)}</td>"
             f"<td>{esc(proc.status or '-')} {esc(proc.state or '')}</td>"
             f"<td>{esc(proc.wait_class or '-')}</td>"
             f"<td>{esc(proc.event or '-')}</td>"
@@ -1182,7 +1241,7 @@ def render_process_table(processes: list[OracleProcess], trace_by_pid: dict[int,
         )
     return (
         "<table><thead><tr><th>PID/SPID</th><th>Name</th><th>SID</th><th>User</th><th>SQL_ID</th><th>oratop %CPU</th>"
-        "<th>trace samples</th><th>CPU</th><th>LSSRAD group</th><th>Status</th><th>Wait class</th><th>Event</th></tr></thead><tbody>"
+        "<th>trace samples</th><th>CPU</th><th>LSSRAD group</th><th>SMT position</th><th>Status</th><th>Wait class</th><th>Event</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1198,10 +1257,11 @@ def render_trace_table(trace_by_pid: dict[int, TraceThread]) -> str:
             f"<td>{trace.samples}</td>"
             f"<td>{esc(top_counter(trace.cpus, 12))}</td>"
             f"<td>{esc(top_counter(trace.lssrad_groups, 5))}</td>"
+            f"<td>{esc(top_counter(trace.smt_positions, 8))}</td>"
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>PID</th><th>Name</th><th>trace samples</th><th>CPU</th><th>LSSRAD group</th></tr></thead><tbody>"
+        "<table><thead><tr><th>PID</th><th>Name</th><th>trace samples</th><th>CPU</th><th>LSSRAD group</th><th>SMT position</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1219,12 +1279,13 @@ def render_sql_table(rows_data: list[dict[str, object]]) -> str:
             f"<td>{esc(', '.join(str(pid) for pid in pids[:12]))}</td>"
             f"<td>{esc(top_counter(row['cpus'], 12))}</td>"
             f"<td>{esc(top_counter(row['lssrad_groups'], 5))}</td>"
+            f"<td>{esc(top_counter(row['smt_positions'], 8))}</td>"
             f"<td>{esc(top_counter(row['users'], 5))}</td>"
             f"<td>{esc(top_counter(row['waits'], 5))}</td>"
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>SQL_ID</th><th>sum %CPU</th><th>PIDs</th><th>PID list</th><th>CPU</th><th>LSSRAD group</th><th>Users</th><th>Wait classes</th></tr></thead><tbody>"
+        "<table><thead><tr><th>SQL_ID</th><th>sum %CPU</th><th>PIDs</th><th>PID list</th><th>CPU</th><th>LSSRAD group</th><th>SMT position</th><th>Users</th><th>Wait classes</th></tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
@@ -1272,6 +1333,7 @@ def build_json_report(
     core_stats = physical_core_stats(placements, mpstat, trace_by_pid)
     smt_stats = smt_position_stats(placements, mpstat, trace_by_pid)
     topology = topology_summary(placements)
+    group_mapping = lssrad_group_mapping(placements)
 
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -1288,6 +1350,7 @@ def build_json_report(
         ],
         "vpm_throughput_mode": vpm_diagnosis,
         "topology": topology,
+        "lssrad_group_mapping": group_mapping,
         "lssrad_group_stats": stats,
         "physical_core_thread_utilization": core_stats,
         "smt_position_summary": smt_stats,
@@ -1329,6 +1392,7 @@ def build_json_report(
                     "samples": trace_by_pid[proc.pid].samples if proc.pid in trace_by_pid else 0,
                     "cpus": counter_to_dict(trace_by_pid[proc.pid].cpus) if proc.pid in trace_by_pid else {},
                     "lssrad_groups": counter_to_dict(trace_by_pid[proc.pid].lssrad_groups) if proc.pid in trace_by_pid else {},
+                    "smt_positions": counter_to_dict(trace_by_pid[proc.pid].smt_positions) if proc.pid in trace_by_pid else {},
                 },
             }
             for proc in sorted(processes.values(), key=lambda item: item.pid)
@@ -1340,6 +1404,7 @@ def build_json_report(
                 "samples": trace.samples,
                 "cpus": counter_to_dict(trace.cpus),
                 "lssrad_groups": counter_to_dict(trace.lssrad_groups),
+                "smt_positions": counter_to_dict(trace.smt_positions),
             }
             for trace in sorted(trace_by_pid.values(), key=lambda row: row.samples, reverse=True)
         ],
@@ -1350,6 +1415,7 @@ def build_json_report(
                 "pids": sorted(row["pids"]),
                 "cpus": counter_to_dict(row["cpus"]),
                 "lssrad_groups": counter_to_dict(row["lssrad_groups"]),
+                "smt_positions": counter_to_dict(row["smt_positions"]),
                 "users": counter_to_dict(row["users"]),
                 "wait_classes": counter_to_dict(row["waits"]),
             }

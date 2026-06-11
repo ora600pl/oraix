@@ -136,6 +136,13 @@ LSSRAD group labels are neutral names derived from CPU range order inside each `
 
 The `Topology by SMT Position` table groups LCPUs by REF, SRAD, and inferred SMT position. For example, when a row contains `0-3 32-35 96-99`, SMT position `0` groups LCPUs `0`, `32`, and `96`; SMT position `1` groups `1`, `33`, and `97`.
 
+Process, trace, and SQL tables show both dimensions:
+
+- `LSSRAD group`, for example `group-1:4, group-2:1`, shows how many trace samples landed in each CPU range order from `lssrad -av`.
+- `SMT position`, for example `0:3, 1:2`, shows which inferred SMT sibling positions were used.
+
+Use `LSSRAD Group Mapping` to translate neutral group names into actual CPU ranges for the host. Use `SMT position` columns and `SMT-Position Summary` to reason about lower versus deeper SMT sibling positions.
+
 The `Active %` column is not a classic CPU busy percentage. It is Oracle trace coverage for a REF/SRAD/SMT position:
 
 ```text
