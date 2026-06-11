@@ -76,6 +76,7 @@ The HTML report includes sortable and filterable tables for:
 - Findings
 - Primary, secondary, and tertiary LCPU summary
 - LCPU map
+- Physical core thread utilization
 - Oracle processes
 - Trace processes by CPU
 - Top SQL IDs from `oratop`
@@ -123,9 +124,25 @@ schedo -p -o vpm_throughput_mode=0
 
 Use runtime changes first for a controlled test window. Apply persistent changes only after the workload benefit is confirmed.
 
+## LCPU and Physical Core Utilization
+
+The report uses two complementary data sources:
+
+- `mpstat -d` describes per-LCPU pressure and dispatch behavior. Important columns include `rq`, `bound`, `cs`, `ics`, `%nsp`, `S0rd`, `S1rd`, `S3rd`, and `S3hrd`.
+- decoded AIX trace shows where Oracle processes actually ran. The report counts trace samples per LCPU and per primary/secondary/tertiary tier.
+
+The `Physical Core Thread Utilization` table groups LCPUs by their position inside each `lssrad -av` SRAD row. For example, when a row contains `0-3 32-35 96-99`, core position `0` groups LCPUs `0`, `32`, and `96`.
+
+The `Active %` column is not a classic CPU busy percentage. It is Oracle trace coverage for a physical core position:
+
+```text
+active LCPU threads with Oracle trace samples / available LCPU threads for that core position
+```
+
+This makes it easy to see whether Oracle work used only primary threads or also unfolded onto secondary and tertiary LCPUs during the capture window.
+
 ## Notes
 
 - Keep `oratop`, trace, and `mpstat` in the same workload window.
 - Prefer decoded `trcrpt` text as `--trace` when generating reports outside AIX.
 - The `test_files` directory, if present locally, may contain environment-specific diagnostic captures and should not be published without review.
-

@@ -486,6 +486,58 @@ def layer_stats(
     return stats
 
 
+def trace_cpu_counts(trace_by_pid: dict[int, TraceThread]) -> Counter[int]:
+    counts: Counter[int] = Counter()
+    for trace in trace_by_pid.values():
+        counts.update(trace.cpus)
+    return counts
+
+
+def physical_core_stats(
+    placements: dict[int, CpuPlacement],
+    mpstat: dict[int, MpstatCpu],
+    trace_by_pid: dict[int, TraceThread],
+) -> list[dict[str, object]]:
+    by_srad: dict[tuple[int | None, int], dict[str, list[int]]] = defaultdict(dict)
+    for placement in placements.values():
+        by_srad[(placement.ref, placement.srad)].setdefault(placement.tier, expand_cpu_group(placement.group))
+
+    trace_counts = trace_cpu_counts(trace_by_pid)
+    rows: list[dict[str, object]] = []
+    for (ref, srad), tier_groups in sorted(by_srad.items(), key=lambda item: ((item[0][0] is None, item[0][0] or -1), item[0][1])):
+        max_threads = max((len(cpus) for cpus in tier_groups.values()), default=0)
+        for core_index in range(max_threads):
+            lcpus: dict[str, int] = {}
+            for tier in TIERS:
+                cpus = tier_groups.get(tier, [])
+                if core_index < len(cpus):
+                    lcpus[tier] = cpus[core_index]
+
+            available = len(lcpus)
+            active = sum(1 for cpu in lcpus.values() if trace_counts.get(cpu, 0) > 0)
+            samples = sum(trace_counts.get(cpu, 0) for cpu in lcpus.values())
+            rq_total = sum(mpstat[cpu].avg("rq") for cpu in lcpus.values() if cpu in mpstat)
+            bound_total = sum(mpstat[cpu].avg("bound") for cpu in lcpus.values() if cpu in mpstat)
+            rows.append(
+                {
+                    "core": f"{ref if ref is not None else '-'}:{srad}:{core_index}",
+                    "ref": ref,
+                    "srad": srad,
+                    "core_index": core_index,
+                    "lcpus": lcpus,
+                    "available_threads": available,
+                    "active_threads": active,
+                    "active_percent": (active / available * 100.0) if available else 0.0,
+                    "trace_samples": samples,
+                    "trace_by_lcpu": {str(cpu): trace_counts.get(cpu, 0) for cpu in lcpus.values()},
+                    "rq_total": rq_total,
+                    "bound_total": bound_total,
+                    "nsp_avg": avg_of([mpstat[cpu] for cpu in lcpus.values() if cpu in mpstat], "%nsp"),
+                }
+            )
+    return sorted(rows, key=lambda row: (int(row["trace_samples"]), float(row["rq_total"])), reverse=True)
+
+
 def avg_of(rows: list[MpstatCpu], key: str) -> float:
     values = [row.avg(key) for row in rows if row.avg(key) is not None]
     return mean(values) if values else 0.0
@@ -704,6 +756,7 @@ def render_report(
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     summarized_events = summarize_events(events)
     top_sql = summarize_sql_ids(processes, trace_by_pid)
+    core_stats = physical_core_stats(placements, mpstat, trace_by_pid)
 
     top_processes = sorted(
         processes.values(),
@@ -767,6 +820,10 @@ code {{ background: #eef2f6; padding: 1px 4px; border-radius: 4px; }}
 
 <h2>LCPU Map</h2>
 {render_cpu_table(placements, mpstat)}
+
+<h2>Physical Core Thread Utilization</h2>
+<p class="note">This table groups LCPUs by their position inside each <code>lssrad -av</code> SRAD row. The utilization percentage is Oracle trace coverage: active LCPU threads with at least one Oracle trace sample divided by available LCPU threads for that physical core position. <code>mpstat -d</code> contributes run queue, bound, and dispatch metrics; it does not provide a direct per-LCPU busy percentage in this format.</p>
+{render_physical_core_table(core_stats)}
 
 <h2>Oracle Processes</h2>
 {render_process_table(top_processes, trace_by_pid)}
@@ -907,6 +964,39 @@ def render_cpu_table(
     )
 
 
+def render_physical_core_table(rows_data: list[dict[str, object]]) -> str:
+    rows = []
+    for row in rows_data:
+        lcpus = row["lcpus"]
+        trace_by_lcpu = row["trace_by_lcpu"]
+        rows.append(
+            "<tr>"
+            f"<td>{esc(row['core'])}</td>"
+            f"<td>{esc(row['ref'] if row['ref'] is not None else '-')}</td>"
+            f"<td>{esc(row['srad'])}</td>"
+            f"<td>{esc(row['core_index'])}</td>"
+            f"<td>{esc(lcpus.get('primary', '-'))}</td>"
+            f"<td>{esc(lcpus.get('secondary', '-'))}</td>"
+            f"<td>{esc(lcpus.get('tertiary', '-'))}</td>"
+            f"<td>{esc(row['active_threads'])}/{esc(row['available_threads'])}</td>"
+            f"<td>{fmt(float(row['active_percent']))}%</td>"
+            f"<td>{esc(row['trace_samples'])}</td>"
+            f"<td>{esc(', '.join(f'{cpu}:{samples}' for cpu, samples in trace_by_lcpu.items()))}</td>"
+            f"<td>{fmt(float(row['rq_total']))}</td>"
+            f"<td>{fmt(float(row['bound_total']))}</td>"
+            f"<td>{fmt(float(row['nsp_avg']))}%</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Core</th><th>REF</th><th>SRAD</th><th>Core position</th>"
+        "<th>Primary LCPU</th><th>Secondary LCPU</th><th>Tertiary LCPU</th>"
+        "<th>Active threads</th><th>Active %</th><th>Trace samples</th><th>Samples by LCPU</th>"
+        "<th>rq total</th><th>bound total</th><th>avg %nsp</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
 def top_counter(counter: Counter, limit: int = 5) -> str:
     if not counter:
         return "-"
@@ -1025,6 +1115,7 @@ def build_json_report(
     summarized_events = summarize_events(events)
     top_sql = summarize_sql_ids(processes, trace_by_pid)
     vpm_diagnosis = diagnose_vpm_throughput_mode(stats, events, processes, trace_by_pid)
+    core_stats = physical_core_stats(placements, mpstat, trace_by_pid)
 
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -1041,6 +1132,7 @@ def build_json_report(
         ],
         "vpm_throughput_mode": vpm_diagnosis,
         "tier_stats": stats,
+        "physical_core_thread_utilization": core_stats,
         "lcpu_map": [
             {
                 "lcpu": cpu,
