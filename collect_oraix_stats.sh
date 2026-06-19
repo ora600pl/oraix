@@ -23,6 +23,9 @@ Output files:
   vmstat_v.out
   vmstat_s.out
   vmstat.out
+  topas.out
+  nmon.nmon
+  nmon.log
   vmo_a.out
   schedo_a.out
   lparstat_i.out
@@ -100,6 +103,9 @@ mpstat_v_file="$out_dir/mpstat_v.out"
 vmstat_v_file="$out_dir/vmstat_v.out"
 vmstat_s_file="$out_dir/vmstat_s.out"
 vmstat_file="$out_dir/vmstat.out"
+topas_file="$out_dir/topas.out"
+nmon_file="$out_dir/nmon.nmon"
+nmon_log_file="$out_dir/nmon.log"
 vmo_file="$out_dir/vmo_a.out"
 schedo_file="$out_dir/schedo_a.out"
 lparstat_file="$out_dir/lparstat_i.out"
@@ -154,6 +160,47 @@ start_optional_bg() {
   fi
 }
 
+start_topas_bg() {
+  last_optional_pid=""
+  echo "Collecting topas batch data into $topas_file"
+  if command -v topas >/dev/null 2>&1; then
+    (
+      echo "# Command: TERM=vt100 topas -i 1"
+      TERM=vt100 topas -i 1 &
+      topas_child=$!
+      sleep "$interval"
+      kill "$topas_child" >/dev/null 2>&1 || true
+      wait "$topas_child" >/dev/null 2>&1 || true
+    ) > "$topas_file" 2>&1 &
+    last_optional_pid=$!
+  else
+    {
+      echo "# Command not found: topas"
+    } > "$topas_file"
+    echo "WARNING: command topas not found; wrote placeholder $topas_file" >&2
+  fi
+}
+
+start_nmon_bg() {
+  last_optional_pid=""
+  echo "Collecting nmon capture data into $nmon_file"
+  if command -v nmon >/dev/null 2>&1; then
+    {
+      echo "# Command: nmon -F $nmon_file -s 1 -c $interval -t"
+    } > "$nmon_log_file"
+    nmon -F "$nmon_file" -s 1 -c "$interval" -t >> "$nmon_log_file" 2>&1 &
+    last_optional_pid=$!
+  else
+    {
+      echo "# Command not found: nmon"
+    } > "$nmon_file"
+    {
+      echo "# Command not found: nmon"
+    } > "$nmon_log_file"
+    echo "WARNING: command nmon not found; wrote placeholder $nmon_file" >&2
+  fi
+}
+
 echo "Writing lssrad data to $lssrad_file"
 lssrad -av > "$lssrad_file"
 
@@ -172,6 +219,10 @@ start_optional_bg "mpstat virtual processor data" "$mpstat_v_file" mpstat -v 1 "
 mpstat_v_pid=$last_optional_pid
 start_optional_bg "vmstat interval data" "$vmstat_file" vmstat 1 "$interval"
 vmstat_pid=$last_optional_pid
+start_topas_bg
+topas_pid=$last_optional_pid
+start_nmon_bg
+nmon_pid=$last_optional_pid
 
 wait "$mpstat_pid"
 if [ -n "$mpstat_v_pid" ]; then
@@ -186,6 +237,23 @@ if [ -n "$vmstat_pid" ]; then
     rc=$?
     echo "# Command failed with exit code $rc: vmstat 1 $interval" >> "$vmstat_file"
     echo "WARNING: vmstat interval data collection failed; see $vmstat_file" >&2
+  }
+fi
+if [ -n "$topas_pid" ]; then
+  wait "$topas_pid" || {
+    rc=$?
+    echo "# Command failed with exit code $rc: TERM=vt100 topas -i 1" >> "$topas_file"
+    echo "WARNING: topas batch data collection failed; see $topas_file" >&2
+  }
+fi
+if [ -n "$nmon_pid" ]; then
+  wait "$nmon_pid" || {
+    rc=$?
+    echo "# Command failed with exit code $rc: nmon -F $nmon_file -s 1 -c $interval -t" >> "$nmon_log_file"
+    if [ ! -s "$nmon_file" ]; then
+      echo "# Command failed with exit code $rc: nmon -F $nmon_file -s 1 -c $interval -t" > "$nmon_file"
+    fi
+    echo "WARNING: nmon capture data collection failed; see $nmon_log_file" >&2
   }
 fi
 
@@ -226,6 +294,9 @@ Files:
   $vmstat_v_file
   $vmstat_s_file
   $vmstat_file
+  $topas_file
+  $nmon_file
+  $nmon_log_file
   $vmo_file
   $schedo_file
   $lparstat_file
@@ -234,5 +305,5 @@ Files:
   $svmon_pmon_file
 
 Example report command:
-  python3 oraix_report.py --oratop /tmp/oratop.out --trace "$trace_report" --lssrad "$lssrad_file" --mpstat "$mpstat_file" --smtctl "$smtctl_file" --mpstat-v "$mpstat_v_file" --vmstat-v "$vmstat_v_file" --vmstat-s "$vmstat_s_file" --vmstat "$vmstat_file" --vmo "$vmo_file" --schedo "$schedo_file" --lparstat "$lparstat_file" --asoo "$asoo_file" --aso-status "$aso_status_file" --svmon-pmon "$svmon_pmon_file" --output "$out_dir/oraix_report.html"
+  python3 oraix_report.py --oratop /tmp/oratop.out --trace "$trace_report" --lssrad "$lssrad_file" --mpstat "$mpstat_file" --smtctl "$smtctl_file" --mpstat-v "$mpstat_v_file" --vmstat-v "$vmstat_v_file" --vmstat-s "$vmstat_s_file" --vmstat "$vmstat_file" --topas "$topas_file" --nmon "$nmon_file" --vmo "$vmo_file" --schedo "$schedo_file" --lparstat "$lparstat_file" --asoo "$asoo_file" --aso-status "$aso_status_file" --svmon-pmon "$svmon_pmon_file" --output "$out_dir/oraix_report.html"
 EOF

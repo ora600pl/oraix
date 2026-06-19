@@ -1,6 +1,6 @@
 # ORAIX Oracle LCPU Report
 
-ORAIX Oracle LCPU Report is a small AIX-focused diagnostic toolkit for Oracle workloads running on IBM Power systems. It collects and correlates `smtctl`, `oratop`, AIX trace, `lssrad`, and `mpstat` output to show where Oracle processes actually ran across LCPUs, SRADs, physical cores, and SMT thread classes.
+ORAIX Oracle LCPU Report is a small AIX-focused diagnostic toolkit for Oracle workloads running on IBM Power systems. It collects and correlates `smtctl`, `oratop`, AIX trace, `lssrad`, `mpstat`, and optional `topas`/`nmon` batch output to show where Oracle processes actually ran across LCPUs, SRADs, physical cores, and SMT thread classes.
 
 The generated report helps answer practical performance questions:
 
@@ -14,7 +14,7 @@ The generated report helps answer practical performance questions:
 ## Contents
 
 - `oraix_report.py` - parser and report generator.
-- `collect_oraix_stats.sh` - AIX collection helper for `lssrad`, trace, `mpstat`, `trcstop`, and `trcrpt`.
+- `collect_oraix_stats.sh` - AIX collection helper for `lssrad`, trace, `mpstat`, `topas`, `nmon`, `trcstop`, and `trcrpt`.
 
 ## Requirements
 
@@ -25,6 +25,8 @@ Collection must run on AIX with the standard AIX tools available:
 - `trcstop`
 - `trcrpt`
 - `mpstat`
+- `topas`
+- `nmon`
 - `oratop`
 - `smtctl`
 
@@ -51,6 +53,8 @@ The script writes:
 - `/tmp/oraix_capture/trace.bin`
 - `/tmp/oraix_capture/trace.out`
 - `/tmp/oraix_capture/mpstat_d.out`
+- `/tmp/oraix_capture/topas.out`
+- `/tmp/oraix_capture/nmon.nmon`
 
 Equivalent manual collection:
 
@@ -59,6 +63,8 @@ smtctl > /tmp/oraix_capture/smtctl.out
 lssrad -av > /tmp/oraix_capture/lssrad_av.out
 trace -a -o /tmp/oraix_capture/trace.bin
 mpstat -d 1 60 > /tmp/oraix_capture/mpstat_d.out
+TERM=vt100 topas -i 1 > /tmp/oraix_capture/topas.out
+nmon -F /tmp/oraix_capture/nmon.nmon -s 1 -c 60 -t
 trcstop
 trcrpt /tmp/oraix_capture/trace.bin > /tmp/oraix_capture/trace.out
 ```
@@ -72,6 +78,8 @@ python3 oraix_report.py \
   --lssrad /tmp/oraix_capture/lssrad_av.out \
   --mpstat /tmp/oraix_capture/mpstat_d.out \
   --smtctl /tmp/oraix_capture/smtctl.out \
+  --topas /tmp/oraix_capture/topas.out \
+  --nmon /tmp/oraix_capture/nmon.nmon \
   --output /tmp/oraix_capture/oraix_report.html
 ```
 
@@ -88,6 +96,7 @@ The HTML report includes sortable and filterable tables for:
 - Trace processes by CPU
 - Top SQL IDs from `oratop`
 - Top wait events from `oratop`
+- `topas`/`nmon` batch capture cross-check
 - `vpm_throughput_mode` diagnosis
 
 ## Generate JSON
@@ -99,6 +108,8 @@ python3 oraix_report.py \
   --lssrad /tmp/oraix_capture/lssrad_av.out \
   --mpstat /tmp/oraix_capture/mpstat_d.out \
   --smtctl /tmp/oraix_capture/smtctl.out \
+  --topas /tmp/oraix_capture/topas.out \
+  --nmon /tmp/oraix_capture/nmon.nmon \
   --format json \
   --output /tmp/oraix_capture/oraix_report.json
 ```

@@ -13,6 +13,8 @@ The tool expects outputs from:
     vmstat -v
     vmstat -s
     vmstat 1 60
+    TERM=vt100 topas -i 1
+    nmon -F /tmp/nmon.nmon -s 1 -c 60 -t
     vmo -F -a
     schedo -a
     lparstat -i
@@ -24,6 +26,7 @@ The tool expects outputs from:
 from __future__ import annotations
 
 import argparse
+import csv
 import html
 import json
 import re
@@ -530,6 +533,235 @@ def parse_vmstat_interval(text: str) -> dict[str, float | None]:
             result[f"{key}_avg"] = mean(values)
             result[f"{key}_max"] = max(values)
     return result
+
+
+def normalize_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def parse_capture_number(value: str | object | None) -> float | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip().replace(",", "").replace("%", "")
+    cleaned = cleaned.strip("<>")
+    if cleaned in {"", "-", "n/a", "N/A"}:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def capture_status(text: str) -> dict[str, object]:
+    stripped = text.strip()
+    lower = stripped.lower()
+    command_not_found = "command not found" in lower
+    terminal_error = bool(re.search(r"\bterminal\s+\S+\s+is\s+unknown\b", lower))
+    command_failed = (
+        "command failed" in lower
+        or terminal_error
+        or ("usage:" in lower and ("topas" in lower or "nmon" in lower))
+    )
+    return {
+        "raw_available": bool(stripped) and not command_not_found and not command_failed,
+        "command_not_found": command_not_found,
+        "command_failed": command_failed,
+        "terminal_error": terminal_error,
+    }
+
+
+def summarize_numeric_rows(rows: list[dict[str, float | None]]) -> dict[str, dict[str, float | int | None]]:
+    summaries: dict[str, dict[str, float | int | None]] = {}
+    keys = sorted({key for row in rows for key in row})
+    for key in keys:
+        values = [row.get(key) for row in rows if row.get(key) is not None]
+        numeric_values = [float(value) for value in values if value is not None]
+        if not numeric_values:
+            continue
+        summaries[key] = {
+            "samples": len(numeric_values),
+            "avg": mean(numeric_values),
+            "min": min(numeric_values),
+            "max": max(numeric_values),
+            "last": numeric_values[-1],
+        }
+    return summaries
+
+
+def metric_stat(
+    summary: dict[str, dict[str, float | int | None]], key_candidates: Iterable[str], stat: str
+) -> float | None:
+    for key in key_candidates:
+        value = summary.get(key, {}).get(stat)
+        number = as_float(value)
+        if number is not None:
+            return number
+    return None
+
+
+def parse_nmon_summary(text: str) -> dict[str, object]:
+    status = capture_status(text)
+    headers: dict[str, list[str]] = {}
+    section_rows: dict[str, list[dict[str, float | None]]] = defaultdict(list)
+    timestamps: list[str] = []
+    top_processes: dict[tuple[str, str], dict[str, object]] = {}
+
+    for row in csv.reader(text.splitlines()):
+        if not row:
+            continue
+        section = row[0].strip()
+        if not section or section.startswith("#"):
+            continue
+        if section == "ZZZZ" and len(row) >= 2:
+            timestamps.append(row[1].strip())
+            continue
+        if len(row) < 2:
+            continue
+
+        marker = row[1].strip()
+        if re.fullmatch(r"T\d+", marker) and section in headers:
+            header = headers[section]
+            values = row[2:]
+            numeric_row = {
+                header[index]: parse_capture_number(values[index])
+                for index in range(min(len(header), len(values)))
+            }
+            section_rows[section].append(numeric_row)
+
+            if section.upper().startswith("TOP"):
+                raw_values = {
+                    header[index]: values[index].strip()
+                    for index in range(min(len(header), len(values)))
+                }
+                pid = next(
+                    (raw_values.get(key, "") for key in ("pid", "process_id", "p_id") if raw_values.get(key, "")),
+                    "",
+                )
+                command = next(
+                    (
+                        raw_values.get(key, "")
+                        for key in ("command", "command_name", "name", "process", "program")
+                        if raw_values.get(key, "")
+                    ),
+                    "",
+                )
+                cpu = metric_stat({key: {"last": value} for key, value in numeric_row.items()}, ("cpu", "cpu_", "cpu_percent"), "last")
+                if not pid and raw_values:
+                    first_value = next(iter(raw_values.values()))
+                    if re.fullmatch(r"\d+", first_value):
+                        pid = first_value
+                if pid or command:
+                    key = (pid, command)
+                    proc = top_processes.setdefault(
+                        key,
+                        {"pid": pid, "command": command, "samples": 0, "cpu_avg": None, "cpu_max": None},
+                    )
+                    proc["samples"] = int(proc["samples"]) + 1
+                    if cpu is not None:
+                        current_total = float(proc.get("_cpu_total", 0.0)) + cpu
+                        proc["_cpu_total"] = current_total
+                        proc["cpu_avg"] = current_total / int(proc["samples"])
+                        proc["cpu_max"] = max(as_float(proc.get("cpu_max")) or 0.0, cpu)
+            continue
+
+        if len(row) >= 3 and not re.fullmatch(r"T\d+", marker):
+            marker_key = normalize_key(marker)
+            header_values = row[1:] if section.upper().startswith("TOP") and "pid" in marker_key else row[2:]
+            header = [normalize_key(value) for value in header_values]
+            if header:
+                headers[section] = header
+
+    cpu_all = summarize_numeric_rows(section_rows.get("CPU_ALL", []))
+    memory = summarize_numeric_rows(section_rows.get("MEM", []))
+    paging = summarize_numeric_rows(section_rows.get("PAGE", []) + section_rows.get("PAGING", []))
+    processes = summarize_numeric_rows(section_rows.get("PROC", []))
+    top_rows = []
+    for proc in top_processes.values():
+        proc.pop("_cpu_total", None)
+        top_rows.append(proc)
+
+    return {
+        **status,
+        "sample_count": len(timestamps) or max((len(rows) for rows in section_rows.values()), default=0),
+        "sections": sorted(section_rows.keys()),
+        "cpu_all": cpu_all,
+        "memory": memory,
+        "paging": paging,
+        "processes": processes,
+        "top_processes": sorted(top_rows, key=lambda row: as_float(row.get("cpu_max")) or 0.0, reverse=True)[:20],
+    }
+
+
+def parse_topas_summary(text: str) -> dict[str, object]:
+    status = capture_status(text)
+    cpu_rows: list[dict[str, float | None]] = []
+    process_rows: dict[tuple[str, str], dict[str, object]] = {}
+    cpu_header: list[str] = []
+    process_header: list[str] = []
+    sample_count = 0
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        lower = line.lower()
+        parts = line.split()
+        if "topas" in lower and ("monitor" in lower or "interval" in lower):
+            sample_count += 1
+
+        normalized_parts = [normalize_key(part) for part in parts]
+        if {"user", "idle"}.issubset(set(normalized_parts)) or {"user", "user_"}.intersection(normalized_parts) and "idle" in normalized_parts:
+            cpu_header = normalized_parts[1:] if normalized_parts and normalized_parts[0] in {"cpu", "processor"} else normalized_parts
+            process_header = []
+            continue
+        if len(parts) >= 3 and "pid" in normalized_parts and any(token.startswith("cpu") for token in normalized_parts):
+            process_header = normalized_parts
+            cpu_header = []
+            continue
+
+        if cpu_header and parts and (parts[0].upper() == "ALL" or parts[0].isdigit()):
+            values = parts[1:] if len(parts) == len(cpu_header) + 1 else parts
+            cpu_rows.append(
+                {
+                    cpu_header[index]: parse_capture_number(values[index])
+                    for index in range(min(len(cpu_header), len(values)))
+                }
+            )
+            continue
+
+        if process_header and len(parts) >= len(process_header):
+            pid_index = process_header.index("pid") if "pid" in process_header else None
+            cpu_index = next((index for index, token in enumerate(process_header) if token.startswith("cpu")), None)
+            name_index = next((index for index, token in enumerate(process_header) if token in {"name", "command"}), 0)
+            if pid_index is None or cpu_index is None or pid_index >= len(parts) or cpu_index >= len(parts):
+                continue
+            pid = parts[pid_index]
+            cpu = parse_capture_number(parts[cpu_index])
+            if not re.fullmatch(r"\d+", pid) or cpu is None:
+                continue
+            name = parts[name_index] if name_index < len(parts) else ""
+            key = (pid, name)
+            proc = process_rows.setdefault(
+                key,
+                {"pid": pid, "name": name, "samples": 0, "cpu_avg": None, "cpu_max": None},
+            )
+            proc["samples"] = int(proc["samples"]) + 1
+            total = float(proc.get("_cpu_total", 0.0)) + cpu
+            proc["_cpu_total"] = total
+            proc["cpu_avg"] = total / int(proc["samples"])
+            proc["cpu_max"] = max(as_float(proc.get("cpu_max")) or 0.0, cpu)
+
+    top_rows = []
+    for proc in process_rows.values():
+        proc.pop("_cpu_total", None)
+        top_rows.append(proc)
+
+    return {
+        **status,
+        "sample_count": sample_count or len(cpu_rows),
+        "cpu": summarize_numeric_rows(cpu_rows),
+        "top_processes": sorted(top_rows, key=lambda row: as_float(row.get("cpu_max")) or 0.0, reverse=True)[:20],
+    }
 
 
 def parse_oratop_summary(text: str) -> dict[str, object]:
@@ -1584,6 +1816,103 @@ def diagnose_thread_constraints(
     }
 
 
+def diagnose_batch_captures(
+    topas: dict[str, object],
+    nmon: dict[str, object],
+    stats: dict[str, dict[str, float | int | None]],
+    rq_threshold: float,
+) -> dict[str, object]:
+    topas_available = bool(topas.get("raw_available"))
+    nmon_available = bool(nmon.get("raw_available"))
+    total_rq = sum_stat(stats, "rq")
+    total_bound = sum_stat(stats, "bound")
+
+    topas_cpu = topas.get("cpu", {}) if isinstance(topas.get("cpu"), dict) else {}
+    nmon_cpu = nmon.get("cpu_all", {}) if isinstance(nmon.get("cpu_all"), dict) else {}
+    topas_idle_avg = metric_stat(topas_cpu, ("idle", "idle_"), "avg")
+    topas_wait_avg = metric_stat(topas_cpu, ("wait", "wait_"), "avg")
+    nmon_idle_avg = metric_stat(nmon_cpu, ("idle", "idle_"), "avg")
+    nmon_wait_avg = metric_stat(nmon_cpu, ("wait", "wait_", "iowait"), "avg")
+    nmon_user_avg = metric_stat(nmon_cpu, ("user", "user_"), "avg")
+    nmon_sys_avg = metric_stat(nmon_cpu, ("sys", "system", "kern", "kernel"), "avg")
+
+    topas_busy_avg = 100.0 - topas_idle_avg if topas_idle_avg is not None else None
+    nmon_busy_avg = 100.0 - nmon_idle_avg if nmon_idle_avg is not None else none_sum((nmon_user_avg, nmon_sys_avg))
+
+    rows = [
+        {
+            "source": "topas",
+            "available": topas_available,
+            "samples": topas.get("sample_count", 0),
+            "cpu_busy_avg": topas_busy_avg,
+            "cpu_wait_avg": topas_wait_avg,
+            "top_processes": topas.get("top_processes", []),
+        },
+        {
+            "source": "nmon",
+            "available": nmon_available,
+            "samples": nmon.get("sample_count", 0),
+            "cpu_busy_avg": nmon_busy_avg,
+            "cpu_wait_avg": nmon_wait_avg,
+            "top_processes": nmon.get("top_processes", []),
+        },
+    ]
+
+    evidence = [
+        f"mpstat total rq={total_rq:.1f}, total bound={total_bound:.1f}; threshold={rq_threshold:.1f}."
+    ]
+    if topas_available:
+        evidence.append(
+            f"topas samples={topas.get('sample_count', 0)}, CPU busy avg={fmt(topas_busy_avg)}%, wait avg={fmt(topas_wait_avg)}%."
+        )
+    elif topas.get("command_not_found"):
+        evidence.append("topas was not found during collection.")
+    elif topas.get("command_failed"):
+        evidence.append("topas collection failed or produced only an error/usage message.")
+    if nmon_available:
+        evidence.append(
+            f"nmon samples={nmon.get('sample_count', 0)}, CPU busy avg={fmt(nmon_busy_avg)}%, wait avg={fmt(nmon_wait_avg)}%."
+        )
+    elif nmon.get("command_not_found"):
+        evidence.append("nmon was not found during collection.")
+    elif nmon.get("command_failed"):
+        evidence.append("nmon collection failed or produced only an error/usage message.")
+
+    level = "ok"
+    title = "topas/nmon batch captures do not add a stronger pressure signal"
+    interpretation = (
+        "Batch topas/nmon data is available as supporting context. The primary LCPU placement diagnosis still comes from mpstat, trace, and oratop."
+    )
+    if not topas_available and not nmon_available:
+        level = "info"
+        title = "topas/nmon batch context was not supplied"
+        interpretation = "Provide --topas and/or --nmon output to add a batch-monitor cross-check to the report."
+    elif total_rq >= rq_threshold or total_bound >= rq_threshold:
+        level = "warning"
+        title = "Batch monitors should be reviewed alongside mpstat CPU pressure"
+        interpretation = (
+            "mpstat already shows CPU queueing pressure. Use topas/nmon to sanity-check whole-system busy/wait levels and top process mix for the same window."
+        )
+    elif any((as_float(row.get("cpu_busy_avg")) or 0.0) >= 85.0 for row in rows if row.get("available")):
+        level = "warning"
+        title = "Batch monitors show high average CPU busy"
+        interpretation = "topas or nmon reports high average CPU busy even though the mpstat run-queue threshold was not crossed."
+    elif any((as_float(row.get("cpu_wait_avg")) or 0.0) >= 10.0 for row in rows if row.get("available")):
+        level = "warning"
+        title = "Batch monitors show notable CPU wait"
+        interpretation = "topas or nmon reports notable wait time. Review disk, paging, and storage sections before treating the issue as pure CPU saturation."
+
+    return {
+        "level": level,
+        "title": title,
+        "interpretation": interpretation,
+        "evidence": evidence,
+        "rows": rows,
+        "topas": topas,
+        "nmon": nmon,
+    }
+
+
 def summarize_events(events: list[dict[str, str]]) -> list[dict[str, str | float | int]]:
     grouped: dict[tuple[str, str], dict[str, str | float | int]] = {}
     for event in events:
@@ -2340,6 +2669,55 @@ def render_thread_constraint_table(diagnosis: dict[str, object]) -> str:
     )
 
 
+def render_batch_process_table(source: str, processes: list[dict[str, object]]) -> str:
+    rows = []
+    for row in processes[:20]:
+        rows.append(
+            "<tr>"
+            f"<td>{esc(source)}</td>"
+            f"<td>{esc(row.get('pid', '-'))}</td>"
+            f"<td>{esc(row.get('name') or row.get('command') or '-')}</td>"
+            f"<td>{fmt(row.get('cpu_avg'))}%</td>"
+            f"<td>{fmt(row.get('cpu_max'))}%</td>"
+            f"<td>{esc(row.get('samples', 0))}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def render_batch_capture_diagnosis(diagnosis: dict[str, object]) -> str:
+    rows = []
+    process_rows = []
+    for row in diagnosis.get("rows", []):
+        rows.append(
+            "<tr>"
+            f"<td>{esc(row.get('source', '-'))}</td>"
+            f"<td>{esc(yes_no(bool(row.get('available'))))}</td>"
+            f"<td>{esc(row.get('samples', 0))}</td>"
+            f"<td>{fmt(row.get('cpu_busy_avg'))}%</td>"
+            f"<td>{fmt(row.get('cpu_wait_avg'))}%</td>"
+            "</tr>"
+        )
+        process_rows.append(render_batch_process_table(str(row.get("source", "-")), row.get("top_processes", [])))
+
+    process_html = "".join(process_rows)
+    process_table = (
+        "<h3>Top Processes from Batch Monitors</h3>"
+        "<table><thead><tr><th>Source</th><th>PID</th><th>Name/command</th><th>avg CPU</th><th>max CPU</th><th>Samples</th></tr></thead><tbody>"
+        + process_html
+        + "</tbody></table>"
+        if process_html
+        else '<p class="note">No top process rows were parsed from topas/nmon batch data.</p>'
+    )
+    return (
+        render_diagnostic_box(diagnosis)
+        + "<table><thead><tr><th>Source</th><th>Available</th><th>Samples</th><th>avg CPU busy</th><th>avg CPU wait</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+        + process_table
+    )
+
+
 def render_report(
     placements: dict[int, CpuPlacement],
     mpstat: dict[int, MpstatCpu],
@@ -2391,6 +2769,12 @@ def render_report(
         lpar_sizing,
     )
     thread_constraints = diagnose_thread_constraints(trace_by_pid, processes, placements, smt_width)
+    batch_capture = diagnose_batch_captures(
+        optional_context.get("topas", {}),
+        optional_context.get("nmon", {}),
+        stats,
+        rq_threshold,
+    )
     top_processes = sorted(
         processes.values(),
         key=lambda proc: ((proc.oratop_cpu or 0), trace_by_pid.get(proc.pid, TraceThread(proc.pid)).samples),
@@ -2473,6 +2857,9 @@ code {{ background: #eef2f6; padding: 1px 4px; border-radius: 4px; }}
 
 <h2>Process Thread Constraints</h2>
 {render_thread_constraint_table(thread_constraints)}
+
+<h2>topas/nmon Batch Capture</h2>
+{render_batch_capture_diagnosis(batch_capture)}
 
 <h3>Per Oracle Process</h3>
 {render_process_table(top_processes, trace_by_pid, smt_width)}
@@ -2599,6 +2986,12 @@ def build_json_report(
         lpar_sizing,
     )
     thread_constraints = diagnose_thread_constraints(trace_by_pid, processes, placements, smt_width)
+    batch_capture = diagnose_batch_captures(
+        optional_context.get("topas", {}),
+        optional_context.get("nmon", {}),
+        stats,
+        rq_threshold,
+    )
 
     return {
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -2623,6 +3016,7 @@ def build_json_report(
         "lpar_sizing": lpar_sizing,
         "extended_vp_folding": extended_vpm,
         "thread_constraints": thread_constraints,
+        "batch_capture_crosscheck": batch_capture,
         "oracle_smt_summary": smt_summary,
         "lssrad_cpu_range_mapping": lssrad_range_mapping(placements),
         "lssrad_cpu_range_stats": stats,
@@ -2908,6 +3302,47 @@ kthr     memory             page              faults        cpu
     lparstat = parse_lparstat("Online Virtual CPUs : 10\nEntitled Capacity : 5.00\n")
     assert_equal(lparstat["online_virtual_cpus"], "10", "parse lparstat online VPs")
 
+    topas_summary = parse_topas_summary(
+        """
+Topas Monitor for host1 Interval: 1
+CPU User% Kern% Wait% Idle%
+ALL 10.0 5.0 0.0 85.0
+Name PID CPU% PgSp Owner
+oracle 1234 12.5 100M oracle
+"""
+    )
+    assert_equal(topas_summary["sample_count"], 1, "parse topas sample count")
+    assert_equal(topas_summary["cpu"]["idle"]["avg"], 85.0, "parse topas idle")
+    assert_equal(topas_summary["top_processes"][0]["pid"], "1234", "parse topas top process pid")
+    topas_terminal_error = parse_topas_summary("# Command: TERM=dumb topas -i 1\nTerminal dumb is unknown.\n")
+    assert_equal(topas_terminal_error["raw_available"], False, "topas terminal errors are not valid captures")
+    assert_equal(topas_terminal_error["terminal_error"], True, "topas terminal error is detected")
+
+    nmon_summary = parse_nmon_summary(
+        """
+AAA,progname,nmon
+ZZZZ,T0001,12:00:00,01-JAN-2026
+CPU_ALL,CPU Total,User%,Sys%,Wait%,Idle%
+CPU_ALL,T0001,10.0,5.0,0.0,85.0
+CPU_ALL,T0002,20.0,10.0,1.0,69.0
+TOP,Top Processes,PID,CPU%,Command
+TOP,T0001,1234,12.5,oracle
+TOP,T0002,1234,7.5,oracle
+"""
+    )
+    assert_equal(nmon_summary["sample_count"], 1, "parse nmon timestamp count")
+    assert_equal(nmon_summary["cpu_all"]["idle"]["avg"], 77.0, "parse nmon CPU_ALL idle avg")
+    assert_equal(nmon_summary["top_processes"][0]["cpu_avg"], 10.0, "parse nmon top process CPU avg")
+
+    nmon_alt_top = parse_nmon_summary(
+        """
+ZZZZ,T0001,12:00:00,01-JAN-2026
+TOP,+PID,CPU%,Command
+TOP,T0001,4321,6.5,ora_dbw0
+"""
+    )
+    assert_equal(nmon_alt_top["top_processes"][0]["pid"], "4321", "parse nmon TOP +PID header")
+
 
 def parse_args() -> argparse.Namespace:
     epilog = """Commands to collect input data on AIX:
@@ -2923,6 +3358,8 @@ def parse_args() -> argparse.Namespace:
   vmstat -v > /tmp/vmstat_v.out
   vmstat -s > /tmp/vmstat_s.out
   vmstat 1 60 > /tmp/vmstat.out
+  TERM=vt100 topas -i 1 > /tmp/topas.out
+  nmon -F /tmp/nmon.nmon -s 1 -c 60 -t
   vmo -F -a > /tmp/vmo_a.out
   schedo -a > /tmp/schedo_a.out
   lparstat -i > /tmp/lparstat_i.out
@@ -2957,6 +3394,8 @@ Example:
     --vmstat-v /tmp/vmstat_v.out \\
     --vmstat-s /tmp/vmstat_s.out \\
     --vmstat /tmp/vmstat.out \\
+    --topas /tmp/topas.out \\
+    --nmon /tmp/nmon.nmon \\
     --vmo /tmp/vmo_a.out \\
     --schedo /tmp/schedo_a.out \\
     --lparstat /tmp/lparstat_i.out \\
@@ -2980,6 +3419,8 @@ Example:
     parser.add_argument("--vmstat-v", help="Optional file generated by: vmstat -v")
     parser.add_argument("--vmstat-s", help="Optional file generated by: vmstat -s")
     parser.add_argument("--vmstat", help="Optional file generated by: vmstat 1 60")
+    parser.add_argument("--topas", help="Optional batch file generated by: TERM=vt100 topas -i 1")
+    parser.add_argument("--nmon", help="Optional capture file generated by: nmon -F /tmp/nmon.nmon -s 1 -c 60 -t")
     parser.add_argument("--vmo", help="Optional file generated by: vmo -F -a")
     parser.add_argument("--schedo", help="Optional file generated by: schedo -a")
     parser.add_argument("--lparstat", help="Optional file generated by: lparstat -i")
@@ -3019,6 +3460,8 @@ def build_optional_context(args: argparse.Namespace, oratop_text: str) -> dict[s
     svmon_text = read_optional_text(args.svmon_pmon)
     oracle_params_text = read_optional_text(args.oracle_params)
     mpstat_v_text = read_optional_text(args.mpstat_v)
+    topas_text = read_optional_text(args.topas)
+    nmon_text = read_optional_text(args.nmon)
 
     return {
         "vmstat_v": parse_vmstat_v(vmstat_v_text),
@@ -3033,6 +3476,8 @@ def build_optional_context(args: argparse.Namespace, oratop_text: str) -> dict[s
         "oracle_params": parse_oracle_params(oracle_params_text),
         "oratop_summary": parse_oratop_summary(oratop_text),
         "mpstat_v_text": mpstat_v_text,
+        "topas": parse_topas_summary(topas_text),
+        "nmon": parse_nmon_summary(nmon_text),
     }
 
 
